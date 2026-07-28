@@ -32,9 +32,11 @@
     ]
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "0.81.1",
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.81.1",
     "@earendil-works/pi-coding-agent": "0.81.1",
     "@types/node": "24.12.4",
     "typescript": "5.9.3",

@@ -2,7 +2,9 @@
 
 A Pi extension for session-scoped observational memory during long user turns.
 
-The current implementation is an inert extension shell: it restores the selected session’s active ancestry, observes completed model-step events, and projects context unchanged.
+The extension watches completed model steps and remains inert below a built-in soft pressure watermark. Above it, the extension asynchronously observes the oldest complete source prefix with the current actor model, validates and persists the resulting memory, and activates it on the next safe context projection. The exact uncovered source tail remains unchanged, and committed memory replays after session reload.
+
+Standalone Observer usage is attributed through the pinned Pi core capability documented in [`pi-core/README.md`](pi-core/README.md).
 
 ## Development
 

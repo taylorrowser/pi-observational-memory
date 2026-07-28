@@ -27,6 +27,7 @@ function extensionApi() {
 function context(ancestry: SessionEntry[], signal?: AbortSignal) {
   return {
     signal,
+    getContextUsage: () => undefined,
     sessionManager: {
       getSessionId: () => "session-1",
       getBranch: () => ancestry,
@@ -119,6 +120,55 @@ describe("observational-memory extension", () => {
     expect(memory.project).toHaveBeenCalledOnce();
     expect(lateContextResult).toBeUndefined();
     expect(appendEntry).not.toHaveBeenCalled();
+  });
+
+  it("supplies the current actor budget at the completed-step seam", async () => {
+    const { pi, handlers } = extensionApi();
+    const memory = memorySpies();
+    const createMemory = vi.fn(() => memory);
+    const ctx = {
+      signal: undefined,
+      model: {
+        provider: "anthropic",
+        id: "claude-sonnet-4-5",
+        contextWindow: 200_000,
+        maxTokens: 8_192,
+      },
+      getContextUsage: () => ({
+        tokens: 125_000,
+        contextWindow: 200_000,
+        percent: 62.5,
+      }),
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getBranch: () => [],
+      },
+    } as unknown as ExtensionContext;
+
+    registerObservationalMemory(pi, createMemory);
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      ctx,
+    );
+    await handlers.get("turn_end")?.(
+      { type: "turn_end", turnIndex: 0, message: undefined, toolResults: [] },
+      ctx,
+    );
+
+    expect(memory.observe).toHaveBeenCalledWith(
+      {
+        sessionId: "session-1",
+        ancestry: [],
+        actor: {
+          provider: "anthropic",
+          model: "claude-sonnet-4-5",
+          contextWindow: 200_000,
+          maxTokens: 8_192,
+        },
+        inputTokens: 125_000,
+      },
+      undefined,
+    );
   });
 
   it("disposes an existing runtime before replacing it", async () => {

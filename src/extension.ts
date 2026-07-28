@@ -14,9 +14,22 @@ import {
 type SessionMemoryFactory = (host: SessionMemoryHost) => SessionMemory;
 
 function snapshot(context: ExtensionContext): SessionSnapshot {
+  const model = context.model;
+  const inputTokens = context.getContextUsage()?.tokens;
   return {
     sessionId: context.sessionManager.getSessionId(),
     ancestry: [...context.sessionManager.getBranch()],
+    ...(model
+      ? {
+          actor: {
+            provider: model.provider,
+            model: model.id,
+            contextWindow: model.contextWindow,
+            maxTokens: model.maxTokens,
+          },
+        }
+      : {}),
+    ...(inputTokens === null || inputTokens === undefined ? {} : { inputTokens }),
   };
 }
 
@@ -24,21 +37,25 @@ export function registerObservationalMemory(
   pi: ExtensionAPI,
   createMemory: SessionMemoryFactory = createSessionMemory,
 ): void {
-  const host = createPiHost(pi);
+  let currentContext: ExtensionContext | undefined;
+  const host = createPiHost(pi, () => currentContext);
   let memory: SessionMemory | undefined;
 
   pi.on("session_start", (_event, context) => {
+    currentContext = context;
     memory?.dispose();
     memory = createMemory(host);
     memory.restore(snapshot(context));
   });
 
   pi.on("turn_end", (_event, context) => {
+    currentContext = context;
     memory?.observe(snapshot(context), context.signal);
   });
 
   pi.on("context", async (event, context) => {
     if (!memory) return;
+    currentContext = context;
 
     return {
       messages: await memory.project(snapshot(context), event.messages),
@@ -48,5 +65,6 @@ export function registerObservationalMemory(
   pi.on("session_shutdown", () => {
     memory?.dispose();
     memory = undefined;
+    currentContext = undefined;
   });
 }
