@@ -23,6 +23,7 @@ describe("SessionMemory", () => {
       appendEntry(customType, data) {
         entries.push({ customType, data });
       },
+      attributeUsage() {},
     });
 
     memory.restore(snapshot);

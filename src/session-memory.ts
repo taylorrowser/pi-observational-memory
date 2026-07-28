@@ -18,8 +18,22 @@ export interface SessionMemory {
   dispose(): void;
 }
 
+type AssistantMessage = Extract<
+  ContextEvent["messages"][number],
+  { role: "assistant" }
+>;
+
+export interface ExtensionUsageAttribution {
+  readonly usage: AssistantMessage["usage"];
+  readonly provider: string;
+  readonly model: string;
+  readonly operation: `${string}:${string}`;
+  readonly passId?: string;
+}
+
 export interface SessionMemoryHost {
   appendEntry(customType: string, data?: unknown): void;
+  attributeUsage(attribution: ExtensionUsageAttribution): void;
 }
 
 export function createSessionMemory(_host: SessionMemoryHost): SessionMemory {
