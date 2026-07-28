@@ -85,6 +85,7 @@ The extension uses existing Pi interfaces wherever possible:
 | Session replacement cleanup | `session_shutdown` |
 | Model changes | `model_select` |
 | Fallback | `ctx.compact()` / stock compaction |
+| Fallback replay boundary | `session_compact` |
 | Minimal status | `ctx.ui.setStatus()` |
 
 The first version should require only the generic extension-usage attribution seam decided in #11, because background Observer and Reflector calls are not ordinary assistant, tool, or compaction calls. No new compaction, session-tree, or provider-request lifecycle seam is assumed.
@@ -114,11 +115,68 @@ At hard headroom:
 
 Do not add alternate Observer ladders, semantic repair calls, background reconstruction, or a multi-state incident system in the first version.
 
-## Lifecycle rule
+## Lifecycle
 
-Derived memory is branch-scoped because its custom entries live on the Pi session tree. Reconstruct only from active-branch ancestry. Cancel and discard in-flight work whenever tree navigation, session replacement, reload, or shutdown invalidates its frozen parent. Never copy in-memory pipeline state across runtimes.
+The lifecycle uses **discard and replay**, not migration. Persist only observation commits and reflection generations. A materialized checkpoint, background-work record, branch-merge record, or repair log is not added.
 
-Detailed lifecycle cases remain in #13; the design goal is discard-and-replay rather than migration.
+### Authority and replay
+
+The active root-to-leaf ancestry is the sole authority. On startup and after a leaf change, scan its custom entries in ancestry order and accept only records whose protocol version is supported and whose parent and coverage references resolve to an earlier contiguous prefix on that same ancestry.
+
+Replay selects:
+
+1. the newest valid reflection generation;
+2. valid observation commits after the prefix folded by that reflection;
+3. the complete active-task anchor from the newest valid observation commit; and
+4. the exact source entries after the newest valid observation boundary.
+
+An orphaned, malformed, mis-parented, or non-contiguous record is ignored and advances no coverage. Exact source remains available, so replay needs no repair record. Records on sibling branches and abandoned descendants are inactive even if they are physically newer in the JSONL file.
+
+### Tree navigation and branch handoff
+
+Successful `/tree` navigation does not wait for memory work. Cancel the one in-flight pass, discard any later result, and replay the destination ancestry before its next actor request.
+
+Do not merge memory from the branch being left. Pi's optional branch summary is the only cross-branch handoff: when present on the destination ancestry, retain its `fromId` and producer provenance and treat its exact text as derived orientation. It cannot by itself verify completion or action-sensitive detail; the actor must recover the abandoned source or re-verify external state before relying on such claims. If the user chooses no Pi branch summary, observational memory carries nothing across the sibling-branch boundary.
+
+This rule does not roll back filesystem effects. With no explicit handoff, the actor must inspect the current workspace just as it does under stock Pi tree navigation.
+
+### Fork, clone, resume, reload, and replacement
+
+Fork and clone inherit valid committed records only when Pi copied those records and every referenced source entry onto the new session's active path. Preserve inherited record identities and provenance; bind all later passes to the child session. Never copy an in-memory pass.
+
+Resume and reload reconstruct from the selected session's active ancestry. A new empty session starts with no observational memory. On session replacement or shutdown, cancel live work and fence the old runtime before rebinding; no result may append through stale extension or session objects.
+
+### In-flight work and activation fence
+
+The one runtime-only pass freezes its session identity, launch leaf, active reflection/observation parents, next uncovered contiguous source range, producer policy, and token estimate. Ordinary descendant model steps may arrive while it runs and do not make it stale.
+
+Immediately before append and activation in `context`, require all of the following:
+
+- the launch leaf is still on the active ancestry;
+- the frozen memory parents are still active;
+- the frozen source range is still the next uncovered contiguous eligible prefix;
+- every covered model step is complete, including all terminal tool results or errors; and
+- the candidate passes protocol, output-budget, and source-reference validation.
+
+Failure of any check discards the candidate and advances no boundary. Cancellation is best effort: a provider response that arrives afterward is still rejected by this fence. Usage reported for rejected, failed, stale, or cancelled calls is still attributed exactly once through #11's session-usage seam, but it never creates a memory commit.
+
+### Model changes
+
+Committed records are provider-agnostic and remain valid across actor-model changes. A pass already frozen under the previously active model may finish with that producer recorded; a model change alone does not make its source or parentage stale.
+
+Before the next actor request, recompute usable input budget, raw watermarks, output allowance, and total projected headroom for the newly selected actor model. A smaller window may force a hard wait, another serial pass, or stock compaction; a larger window does not resurrect covered exact source. Model selection by itself does not launch work below the soft watermark.
+
+### Retries, failures, aborts, and cancellation
+
+A terminal tool error belongs to a completed model step and may be observed; preserve decision-relevant failure evidence and never reinterpret it as completion. A retryable provider failure or aborted/partial assistant response does not establish an observation boundary. It remains exact until a later completed boundary can cover the contiguous range, at which point its failed or aborted status must remain explicit if retained.
+
+Automatic actor retries do not rewind committed memory and do not invalidate a pass over an unchanged ancestor prefix. Propagate Pi's active abort signal into memory calls so Escape can cancel associated work; cancellation never erases prior commits. Memory-call failure, malformed or empty output, timeout, or cancellation commits nothing and leaves exact source active. The first version adds no memory-specific retry ladder or user control: later eligible work may try the normal policy again, and hard-headroom failure falls through to stock Pi compaction.
+
+### Stock-compaction boundary
+
+A successful stock Pi compaction is a replay boundary. Cancel observational work frozen before it, let Pi's compaction summary and retained tail own the active projection at that point, and do not reactivate earlier observational records while the compaction entry remains on the active ancestry. Later observation may resume over completed model steps after the compaction boundary and create a fresh complete anchor.
+
+Navigating to an ancestry before that compaction entry naturally restores the observational records valid at that earlier leaf. No degraded-history reconstruction or extra fallback record is required.
 
 ## Configuration
 
@@ -132,8 +190,8 @@ The smallest useful implementation evidence is:
 
 1. deterministic tests that generated sequential and parallel tool batches are never split;
 2. replay tests for contiguous coverage, one active reflection, newest-anchor selection, and stale-pass rejection;
-3. lifecycle tests for tree navigation, resume, reload, model change, abort, and session replacement;
-4. fallback tests showing no coverage advance on invalid work and safe stock compaction at hard headroom; and
+3. lifecycle tests for tree navigation with and without a handoff, fork/clone, resume/reload, model change, retry, abort, and session replacement;
+4. fallback tests showing no coverage advance on invalid work and safe replay across a stock-compaction boundary; and
 5. a small paired end-to-end comparison with full history and stock Pi on long user turns containing many model steps.
 
 Do not build a benchmark platform first. Expand toward #9's formal acceptance matrix only if the small paired evaluation justifies continuing.

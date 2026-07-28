@@ -8,6 +8,14 @@ This context describes the minimal session-scoped design for preserving continui
 The exact, branch-scoped Pi session history. It remains ground truth after derived memory replaces older messages in active model context.
 _Avoid_: Memory store, shadow transcript
 
+**Active ancestry**:
+The ordered root-to-leaf path selected in Pi's session tree. It is the sole authority for replaying memory history; records on sibling branches or abandoned descendants are inactive.
+_Avoid_: Session-wide memory, latest file state
+
+**Branch handoff**:
+An explicit, provenance-carrying branch summary attached to the destination ancestry when Pi tree navigation intentionally carries orientation from the branch being left. It is derived context, not exact source evidence.
+_Avoid_: Implicit memory merge, branch leakage
+
 **User turn**:
 One user message followed by all model/tool iterations needed to reach the final settled assistant response. A user turn may contain many model steps.
 _Avoid_: Pi turn, model request
