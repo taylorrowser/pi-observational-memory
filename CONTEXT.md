@@ -1,29 +1,49 @@
 # Observational Memory
 
-This context describes the minimal Pi-native design for preserving continuity when a long session no longer fits in active model context.
+This context describes the minimal session-scoped design for preserving continuity during long Pi user turns.
 
 ## Language
 
 **Source transcript**:
-The exact, branch-scoped Pi session history. It remains the ground truth after compaction and keeps Pi’s normal tree, fork, clone, resume, and export behavior.
+The exact, branch-scoped Pi session history. It remains ground truth after derived memory replaces older messages in active model context.
 _Avoid_: Memory store, shadow transcript
 
+**User turn**:
+One user message followed by all model/tool iterations needed to reach the final settled assistant response. A user turn may contain many model steps.
+_Avoid_: Pi turn, model request
+
+**Model step**:
+One provider request, its assistant response, and the complete resulting tool-call batch, including every terminal tool result or error. Pi exposes this lifecycle through `turn_start` and `turn_end`.
+_Avoid_: LLM turn, user turn
+
+**Observation boundary**:
+The seam after a model step has completed and before the next provider request. Only complete model steps may move from exact transcript context into derived memory.
+_Avoid_: End of user turn, arbitrary message boundary
+
+**Memory history**:
+The observation commits and reflection generations persisted as custom entries on the Pi session branch. Replay of the active branch reconstructs active memory; no separate checkpoint file is authoritative.
+_Avoid_: Sidecar, mutable memory record
+
+**Observation commit**:
+The atomic result of one Observer pass over a contiguous prefix of completed model steps. It contains ordered observations, a complete active-task anchor snapshot, source coverage, producer/usage provenance, and validity status.
+_Avoid_: Summary blob, partial observer output
+
+**Reflection**:
+An immutable generation that folds the previous active reflection and a contiguous prefix of observations into denser historical context. Newer observations remain detailed.
+_Avoid_: Observation, destructive rewrite
+
+**Active-task anchor**:
+The complete current-task snapshot stored inside every observation commit: original intent, constraints, verified progress, current work, blockers, unresolved questions, ownership of the next move, and next action. It is not a separate record stream.
+_Avoid_: Patch chain, inferred task state
+
 **Active memory**:
-The context Pi sends after compaction: one compaction summary followed by Pi’s retained exact tail. It is rebuilt by Pi from the active session branch rather than maintained as a separate projection.
-_Avoid_: Continuation checkpoint, observation layer
-
-**Observational compaction**:
-Ordinary Pi compaction whose summary is generated with a continuity-focused prompt and, optionally, a cheaper or faster model. It uses Pi’s trigger, cut point, retained tail, compaction entry, cancellation, retry, usage accounting, and UI lifecycle.
-_Avoid_: Background observation pipeline, memory subsystem
-
-**Continuation state**:
-The goal, constraints, verified progress, current work, blockers, key decisions, and next step that a compaction summary must preserve so the actor can continue without asking the user to reconstruct the task. It is summary content, not a separately persisted record.
-_Avoid_: Active-task anchor, task sidecar
+The context supplied to the actor: active reflection, newer observations, newest active-task anchor, and the exact source-transcript tail not covered by observations.
+_Avoid_: Compaction summary, full transcript
 
 **Completion**:
 A task state supported by explicit user confirmation or durable tool or artifact evidence. Intent, elapsed time, attempted work, or an unsupported assistant claim does not establish completion.
 _Avoid_: Assumed completion, inferred completion
 
 **Operational exactness**:
-The requirement that action-sensitive details such as paths, commands, errors, URLs, and quantities remain exact in the retained tail or be preserved accurately in the compaction summary before they are used.
-_Avoid_: Verbatim everything, automatic recall subsystem
+The requirement that action-sensitive details remain exact in active memory or are recovered from traceable source before use.
+_Avoid_: Verbatim everything, untraceable paraphrase
