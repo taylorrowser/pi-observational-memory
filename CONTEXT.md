@@ -48,9 +48,33 @@ _Avoid_: Self-summary, pinned fact
 The smallest context unit that may move across an observation boundary: one assistant output, its complete parallel tool-call batch, every terminal result or error, and any provider-coupled reasoning state. An incomplete batch cannot be observed and retired.
 _Avoid_: Message boundary, arbitrary token boundary
 
+**Delayed memory**:
+A status in which due memory work has not completed, but the prior active memory and exact uncovered source remain valid and safe for actor use. It is an operational delay, not fidelity degradation.
+_Avoid_: Degraded memory, failed memory
+
 **Degraded memory**:
-Active memory produced by a safe fallback after normal observation fails or cannot complete in time. It remains usable but carries an inspectable status identifying the failure, fallback, and possible fidelity loss.
+Active memory produced by a safe lower-fidelity fallback when normal observational contraction is unavailable, late, invalid, unaffordable, cancelled, or deliberately paused. It remains usable but carries an inspectable status identifying the cause, fallback, and possible fidelity loss.
 _Avoid_: Normal memory, silent fallback
+
+**Fallback projection**:
+A provider-valid active-memory projection produced by a lower-fidelity contraction mechanism when normal observation cannot safely continue. It remains degraded until normal memory is rebuilt from canonical source.
+_Avoid_: Normal observation, silent compaction
+
+**Hard-headroom gate**:
+The pre-provider safety state in which actor model calls must wait because uncovered source or the complete projected request no longer leaves model-safe headroom. A provider-valid agent batch already in progress remains indivisible.
+_Avoid_: Context overflow, hard watermark
+
+**Memory correction**:
+An exact user-authored statement that disputes or replaces meaning in derived memory while preserving the original record and provenance. It enters active memory immediately; later reflection may reconcile it into the chronology.
+_Avoid_: Memory edit, record rewrite
+
+**Memory inspector**:
+The user-facing view of the active checkpoint, source boundaries, fidelity, provenance, memory work, incidents, and controls.
+_Avoid_: Memory editor, debug log
+
+**Observation pause**:
+A user-selected mode that stops new observation and reflection model passes while retaining the existing active memory. Conventional Pi compaction may still provide context safety.
+_Avoid_: Disable memory, unsafe bypass
 
 **Operational exactness**:
 The requirement that action-sensitive details survive verbatim in active memory or be recovered from a traceable source before use. Semantic paraphrase is acceptable only when wording or values cannot change the resulting action.
