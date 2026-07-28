@@ -2,6 +2,7 @@
 
 import {
   POLICY_PRESETS,
+  resolvePolicy,
   simulateFullReplay,
   simulateObservationalMemory,
   simulatePiCompaction,
@@ -69,6 +70,7 @@ export function robustnessSweep(trace, config) {
   let cases = 0;
   let cheaper = 0;
   let safe = 0;
+  let qualityPressureCases = 0;
   let qualityBetter = 0;
   let noHardWait = 0;
   let bestDelta = Number.POSITIVE_INFINITY;
@@ -80,7 +82,7 @@ export function robustnessSweep(trace, config) {
         for (const cacheReuseFactor of cacheReuseFactors) {
           const conventionalConfig = {
             ...config,
-            ...policy,
+            ...resolvePolicy(policy, contextWindow - config.outputReserve),
             contextWindow,
             observerDelayCalls,
             cacheReuseFactor,
@@ -102,7 +104,10 @@ export function robustnessSweep(trace, config) {
               cases += 1;
               cheaper += Number(delta <= 0);
               safe += Number(om.overBudgetCalls === 0);
-              qualityBetter += Number(om.qualityRiskCalls < conventionalQualityRisk);
+              if (conventionalQualityRisk > 0) {
+                qualityPressureCases += 1;
+                qualityBetter += Number(om.qualityRiskCalls < conventionalQualityRisk);
+              }
               noHardWait += Number(om.hardWaits === 0);
               bestDelta = Math.min(bestDelta, delta);
               worstDelta = Math.max(worstDelta, delta);
@@ -117,6 +122,7 @@ export function robustnessSweep(trace, config) {
     cases,
     cheaper,
     safe,
+    qualityPressureCases,
     qualityBetter,
     noHardWait,
     bestDelta,

@@ -28,8 +28,9 @@ The loader retains no conversation text. It derives only call count, model, toke
 
 ## Current assumptions to challenge
 
-- Actor prompt caching uses a stable-prefix model with 1,024-token cache quanta. The sensitivity view also sweeps cold, partial, and full cache-reuse regimes.
+- Actor prompt caching uses a stable-prefix model with 1,024-token cache quanta and separate read/write price buckets. The sensitivity view also sweeps cold, partial, and full cache-reuse regimes.
 - A memory activation invalidates the actor cache only from the first changed projection segment onward; invalidated prefix volume is reported explicitly.
+- Raw and observation watermarks are fractions of the usable actor-input budget, so changing model windows rescales them as required by issue #6. The 272k-window balanced policy is approximately 20k/40k/60k raw target/soft/hard.
 - Observer rates start at 20% of actor-model rates.
 - Observation output is 12% of retired raw tokens; reflection output is 35% of folded memory.
 - Pi conventional compaction is eligible only after a completed low-level run and keeps an approximately 20k-token exact tail.

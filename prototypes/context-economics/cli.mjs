@@ -2,7 +2,11 @@
 // PROTOTYPE: interactive terminal shell around the pure economics model.
 
 import readline from "node:readline";
-import { compareStrategies, defaultConfig, POLICY_PRESETS } from "./model.mjs";
+import {
+  compareStrategies,
+  defaultConfig,
+  POLICY_PRESETS,
+} from "./model.mjs";
 import {
   breakEvenGrid,
   OBSERVER_MULTIPLIERS,
@@ -68,7 +72,7 @@ function currentState() {
   const config = defaultConfig(trace, {
     contextWindow: windows[windowIndex],
     observerDelayCalls: delays[delayIndex],
-    ...preset,
+    policyPreset: preset,
   });
   return { trace, preset, config };
 }
@@ -114,13 +118,14 @@ function renderOutcome(state) {
 
   console.log(`\n${bold}Outcome${reset}`);
   console.log(
-    `  ${pad("strategy", 23, "left")} ${pad("actor fresh", 12)} ${pad("cache read", 11)} ${pad("memory I/O", 13)} ${pad("max ctx", 9)} ${pad("safe/q", 8)} ${pad("cost", 9)}`,
+    `  ${pad("strategy", 23, "left")} ${pad("actor fresh", 12)} ${pad("cache R/W", 13)} ${pad("memory I/O", 13)} ${pad("max ctx", 9)} ${pad("safe/q", 8)} ${pad("cost", 9)}`,
   );
   for (const result of results) {
+    const cache = `${formatTokens(result.cacheRead)}/${formatTokens(result.cacheWrite)}`;
     const memory = `${formatTokens(result.memoryInput)}/${formatTokens(result.memoryOutput)}`;
     const risk = `${result.overBudgetCalls}/${result.qualityRiskCalls}`;
     console.log(
-      `  ${pad(result.strategy, 23, "left")} ${pad(formatTokens(result.actorInput), 12)} ${pad(formatTokens(result.cacheRead), 11)} ${pad(memory, 13)} ${pad(formatTokens(result.maxContext), 9)} ${pad(risk, 8)} ${pad(formatMoney(result.totalCost), 9)}`,
+      `  ${pad(result.strategy, 23, "left")} ${pad(formatTokens(result.actorInput), 12)} ${pad(cache, 13)} ${pad(memory, 13)} ${pad(formatTokens(result.maxContext), 9)} ${pad(risk, 8)} ${pad(formatMoney(result.totalCost), 9)}`,
     );
   }
 
@@ -178,7 +183,7 @@ function renderSensitivity(state) {
     `  ${robustness.cases.toLocaleString()} cases: 64k/128k/272k windows × 3 policies × 4 lags × 3 cache regimes × 4 observer prices × 3 compression ratios`,
   );
   console.log(
-    `  cheaper ${share(robustness.cheaper, robustness.cases)} · safe ${share(robustness.safe, robustness.cases)} · quality-length improvement ${share(robustness.qualityBetter, robustness.cases)} · no hard wait ${share(robustness.noHardWait, robustness.cases)}`,
+    `  cheaper ${share(robustness.cheaper, robustness.cases)} · safe ${share(robustness.safe, robustness.cases)} · quality-length improvement ${share(robustness.qualityBetter, robustness.qualityPressureCases)} of ${robustness.qualityPressureCases.toLocaleString()} pressured cases · no hard wait ${share(robustness.noHardWait, robustness.cases)}`,
   );
   console.log(
     `  cost range: ${formatPercent(robustness.bestDelta)} best to ${formatPercent(robustness.worstDelta)} worst vs cheaper conventional strategy`,

@@ -3,29 +3,39 @@
 export const POLICY_PRESETS = [
   {
     name: "aggressive",
-    rawTarget: 12_000,
-    rawSoft: 24_000,
-    rawHard: 40_000,
-    observationTarget: 14_000,
-    observationHigh: 28_000,
+    rawTargetFraction: 0.047,
+    rawSoftFraction: 0.094,
+    rawHardFraction: 0.156,
+    observationTargetFraction: 0.055,
+    observationHighFraction: 0.11,
   },
   {
     name: "balanced",
-    rawTarget: 20_000,
-    rawSoft: 40_000,
-    rawHard: 60_000,
-    observationTarget: 20_000,
-    observationHigh: 40_000,
+    rawTargetFraction: 0.078,
+    rawSoftFraction: 0.156,
+    rawHardFraction: 0.235,
+    observationTargetFraction: 0.078,
+    observationHighFraction: 0.156,
   },
   {
     name: "conservative",
-    rawTarget: 32_000,
-    rawSoft: 64_000,
-    rawHard: 96_000,
-    observationTarget: 32_000,
-    observationHigh: 64_000,
+    rawTargetFraction: 0.125,
+    rawSoftFraction: 0.25,
+    rawHardFraction: 0.375,
+    observationTargetFraction: 0.125,
+    observationHighFraction: 0.25,
   },
 ];
+
+export function resolvePolicy(policy, usableActorInput) {
+  return {
+    rawTarget: Math.round(usableActorInput * policy.rawTargetFraction),
+    rawSoft: Math.round(usableActorInput * policy.rawSoftFraction),
+    rawHard: Math.round(usableActorInput * policy.rawHardFraction),
+    observationTarget: Math.round(usableActorInput * policy.observationTargetFraction),
+    observationHigh: Math.round(usableActorInput * policy.observationHighFraction),
+  };
+}
 
 export function defaultConfig(trace, overrides = {}) {
   const actorRates = overrides.actorRates ?? trace.rates ?? {
@@ -38,10 +48,16 @@ export function defaultConfig(trace, overrides = {}) {
   const observerRates = overrides.observerRates ?? Object.fromEntries(
     Object.entries(actorRates).map(([key, value]) => [key, value * observerRateMultiplier]),
   );
+  const contextWindow = overrides.contextWindow ?? 272_000;
+  const outputReserve = overrides.outputReserve ?? 16_384;
+  const policy = resolvePolicy(
+    overrides.policyPreset ?? POLICY_PRESETS[1],
+    contextWindow - outputReserve,
+  );
 
   return {
-    contextWindow: 272_000,
-    outputReserve: 16_384,
+    contextWindow,
+    outputReserve,
     qualityThresholdFraction: 0.5,
     fixedTokens: trace.fixedTokens ?? 5_000,
     cacheQuantum: 1_024,
@@ -59,7 +75,7 @@ export function defaultConfig(trace, overrides = {}) {
     observationCompression: 0.12,
     anchorTokens: 900,
     reflectionCompression: 0.35,
-    ...POLICY_PRESETS[1],
+    ...policy,
     ...overrides,
   };
 }
