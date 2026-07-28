@@ -28,23 +28,28 @@ export const POLICY_PRESETS = [
 ];
 
 export function defaultConfig(trace, overrides = {}) {
-  const actorRates = trace.rates ?? {
+  const actorRates = overrides.actorRates ?? trace.rates ?? {
     input: 5,
     output: 30,
     cacheRead: 0.5,
     cacheWrite: 5,
   };
+  const observerRateMultiplier = overrides.observerRateMultiplier ?? 0.2;
+  const observerRates = overrides.observerRates ?? Object.fromEntries(
+    Object.entries(actorRates).map(([key, value]) => [key, value * observerRateMultiplier]),
+  );
 
   return {
     contextWindow: 272_000,
     outputReserve: 16_384,
+    qualityThresholdFraction: 0.5,
     fixedTokens: trace.fixedTokens ?? 5_000,
     cacheQuantum: 1_024,
+    cacheReuseFactor: 1,
     cacheWriteFraction: 0,
     actorRates,
-    observerRates: Object.fromEntries(
-      Object.entries(actorRates).map(([key, value]) => [key, value * 0.2]),
-    ),
+    observerRateMultiplier,
+    observerRates,
     piKeepRecent: 20_000,
     piSummaryCompression: 0.15,
     piSummaryMax: 8_000,
@@ -72,11 +77,14 @@ function billRequest({
   maxCacheRead = Number.POSITIVE_INFINITY,
 }) {
   const totalInput = projection.reduce((sum, segment) => sum + segment.tokens, 0);
+  const previousInput = previousProjection.reduce((sum, segment) => sum + segment.tokens, 0);
   const stablePrefix = commonPrefixTokens(previousProjection, projection);
-  const cacheRead = Math.min(
+  const cacheEligible = Math.min(
     maxCacheRead,
     Math.floor(stablePrefix / config.cacheQuantum) * config.cacheQuantum,
   );
+  const cacheRead = Math.round(cacheEligible * config.cacheReuseFactor);
+  const invalidatedPrefix = Math.max(0, previousInput - stablePrefix);
   const uncached = Math.max(0, totalInput - cacheRead);
   const cacheWrite = Math.round(uncached * config.cacheWriteFraction);
   const input = uncached - cacheWrite;
@@ -86,7 +94,15 @@ function billRequest({
     tokenCost(cacheWrite, rates.cacheWrite) +
     tokenCost(outputTokens, rates.output);
 
-  return { totalInput, input, cacheRead, cacheWrite, output: outputTokens, cost };
+  return {
+    totalInput,
+    input,
+    cacheRead,
+    cacheWrite,
+    invalidatedPrefix,
+    output: outputTokens,
+    cost,
+  };
 }
 
 function commonPrefixTokens(left = [], right = []) {
@@ -113,20 +129,24 @@ function emptyMetrics(strategy) {
     memoryCost: 0,
     maxContext: 0,
     overBudgetCalls: 0,
+    qualityRiskCalls: 0,
+    invalidatedPrefix: 0,
     contractions: 0,
     hardWaits: 0,
     contextSeries: [],
   };
 }
 
-function recordActor(metrics, bill, safeInput) {
+function recordActor(metrics, bill, safeInput, qualityThreshold) {
   metrics.actorInput += bill.input;
   metrics.actorOutput += bill.output;
   metrics.cacheRead += bill.cacheRead;
   metrics.cacheWrite += bill.cacheWrite;
+  metrics.invalidatedPrefix += bill.invalidatedPrefix;
   metrics.actorCost += bill.cost;
   metrics.maxContext = Math.max(metrics.maxContext, bill.totalInput);
   metrics.overBudgetCalls += Number(bill.totalInput > safeInput);
+  metrics.qualityRiskCalls += Number(bill.totalInput > qualityThreshold);
   metrics.contextSeries.push(bill.totalInput);
 }
 
@@ -153,6 +173,7 @@ export function simulateFullReplay(trace, config) {
   const raw = [];
   let previousProjection = [];
   const safeInput = config.contextWindow - config.outputReserve;
+  const qualityThreshold = safeInput * config.qualityThresholdFraction;
 
   trace.calls.forEach((call, index) => {
     raw.push(rawSegment(call, index));
@@ -165,7 +186,7 @@ export function simulateFullReplay(trace, config) {
       rates: config.actorRates,
       maxCacheRead: call.observedCacheRead,
     });
-    recordActor(metrics, bill, safeInput);
+    recordActor(metrics, bill, safeInput, qualityThreshold);
     previousProjection = current;
   });
 
@@ -179,6 +200,7 @@ export function simulatePiCompaction(trace, config) {
   let summaryVersion = 0;
   let previousProjection = [];
   const safeInput = config.contextWindow - config.outputReserve;
+  const qualityThreshold = safeInput * config.qualityThresholdFraction;
 
   trace.calls.forEach((call, index) => {
     raw.push(rawSegment(call, index));
@@ -191,7 +213,7 @@ export function simulatePiCompaction(trace, config) {
       rates: config.actorRates,
       maxCacheRead: call.observedCacheRead,
     });
-    recordActor(metrics, bill, safeInput);
+    recordActor(metrics, bill, safeInput, qualityThreshold);
     previousProjection = current;
 
     if (call.turnEnd && bill.totalInput > safeInput) {
@@ -223,7 +245,6 @@ export function simulatePiCompaction(trace, config) {
       summary = { id: `pi-summary-${summaryVersion}`, tokens: memoryOutput };
       raw = kept;
       metrics.contractions += 1;
-      previousProjection = [];
     }
   });
 
@@ -256,6 +277,7 @@ export function simulateObservationalMemory(trace, config) {
   let previousActorProjection = [];
   let previousObserverProjection = [];
   const safeInput = config.contextWindow - config.outputReserve;
+  const qualityThreshold = safeInput * config.qualityThresholdFraction;
 
   function activeProjection() {
     return projection(
@@ -361,7 +383,7 @@ export function simulateObservationalMemory(trace, config) {
       rates: config.actorRates,
       maxCacheRead: call.observedCacheRead,
     });
-    recordActor(metrics, bill, safeInput);
+    recordActor(metrics, bill, safeInput, qualityThreshold);
     previousActorProjection = current;
   });
 

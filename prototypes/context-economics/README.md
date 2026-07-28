@@ -23,16 +23,18 @@ The loader retains no conversation text. It derives only call count, model, toke
 - `p`: aggressive / balanced / conservative observational-memory policy
 - `w`: context-window size
 - `d`: observer completion lag measured in actor calls
+- `s`: toggle between the single-policy outcome and the break-even/sensitivity sweep
 - `q`: quit
 
 ## Current assumptions to challenge
 
-- Actor prompt caching uses a stable-prefix model with 1,024-token cache quanta.
-- A memory activation invalidates the actor cache only from the first changed projection segment onward.
+- Actor prompt caching uses a stable-prefix model with 1,024-token cache quanta. The sensitivity view also sweeps cold, partial, and full cache-reuse regimes.
+- A memory activation invalidates the actor cache only from the first changed projection segment onward; invalidated prefix volume is reported explicitly.
 - Observer rates start at 20% of actor-model rates.
 - Observation output is 12% of retired raw tokens; reflection output is 35% of folded memory.
 - Pi conventional compaction is eligible only after a completed low-level run and keeps an approximately 20k-token exact tail.
 - The local trace transform treats growth in provider-reported prompt tokens as new source-transcript volume. It is useful for shape, but it is not exact source tokenization.
-- `risk` counts actor requests above `contextWindow - outputReserve`; it does not claim those requests necessarily failed at the provider.
+- `safe/q` reports two counts: actor requests above `contextWindow - outputReserve`, then requests above an illustrative quality-sensitive threshold of 50% of safe input. Neither count proves provider failure or quality loss.
+- The sensitivity surface sweeps observer price and compression ratio. Its broader robustness pass also sweeps model window, watermark policy, observer lag, and cache reuse.
 
-These assumptions are surfaced because the prototype's purpose is to find which uncertain variables can reverse the decision. Quality is deliberately absent: issue #9 owns acceptance thresholds, while #7 should identify the economic regimes that those evaluations must cover.
+These assumptions are surfaced because the prototype's purpose is to find which uncertain variables can reverse the decision. Quality-sensitive context length is modeled as a threshold, not measured task quality: issue #9 owns acceptance thresholds, while #7 should identify the economic regimes those evaluations must cover.

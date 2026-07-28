@@ -3,6 +3,11 @@
 
 import readline from "node:readline";
 import { compareStrategies, defaultConfig, POLICY_PRESETS } from "./model.mjs";
+import {
+  breakEvenGrid,
+  OBSERVER_MULTIPLIERS,
+  robustnessSweep,
+} from "./sensitivity.mjs";
 import { loadTraces } from "./session-traces.mjs";
 
 const traces = loadTraces();
@@ -10,6 +15,7 @@ let traceIndex = 0;
 let policyIndex = 1;
 let windowIndex = 2;
 let delayIndex = 1;
+let view = "outcome";
 const windows = [64_000, 128_000, 272_000, 1_000_000];
 const delays = [0, 2, 5, 10];
 
@@ -25,6 +31,14 @@ function formatTokens(value) {
 
 function formatMoney(value) {
   return `$${value.toFixed(value >= 10 ? 2 : 3)}`;
+}
+
+function formatPercent(value, digits = 0) {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(digits)}%`;
+}
+
+function share(count, total) {
+  return `${((count / Math.max(1, total)) * 100).toFixed(0)}%`;
 }
 
 function pad(value, width, align = "right") {
@@ -48,7 +62,7 @@ function sparkline(values, maxValue) {
     .join("");
 }
 
-function render() {
+function currentState() {
   const trace = traces[traceIndex];
   const preset = POLICY_PRESETS[policyIndex];
   const config = defaultConfig(trace, {
@@ -56,8 +70,12 @@ function render() {
     observerDelayCalls: delays[delayIndex],
     ...preset,
   });
-  const results = compareStrategies(trace, config);
+  return { trace, preset, config };
+}
+
+function renderHeader({ trace, preset, config }) {
   const safeInput = config.contextWindow - config.outputReserve;
+  const qualityThreshold = safeInput * config.qualityThresholdFraction;
   const finalRaw = trace.calls.reduce((sum, call) => sum + call.sourceDelta, 0);
 
   console.clear();
@@ -79,7 +97,7 @@ function render() {
 
   console.log(`\n${bold}Policy state${reset}`);
   console.log(
-    `  window ${formatTokens(config.contextWindow)} · safe actor input ${formatTokens(safeInput)} · observer lag ${config.observerDelayCalls} calls`,
+    `  window ${formatTokens(config.contextWindow)} · safe ${formatTokens(safeInput)} · quality-sensitive ${formatTokens(qualityThreshold)} · observer lag ${config.observerDelayCalls} calls`,
   );
   console.log(
     `  ${preset.name}: raw ${formatTokens(config.rawTarget)} / ${formatTokens(config.rawSoft)} / ${formatTokens(config.rawHard)} target/soft/hard`,
@@ -87,15 +105,22 @@ function render() {
   console.log(
     `  observation ${formatTokens(config.observationTarget)} / ${formatTokens(config.observationHigh)} target/high · observer rates 20% of actor`,
   );
+}
+
+function renderOutcome(state) {
+  const { trace, config } = state;
+  const results = compareStrategies(trace, config);
+  const safeInput = config.contextWindow - config.outputReserve;
 
   console.log(`\n${bold}Outcome${reset}`);
   console.log(
-    `  ${pad("strategy", 23, "left")} ${pad("actor fresh", 12)} ${pad("cache read", 11)} ${pad("memory I/O", 13)} ${pad("max ctx", 9)} ${pad("risk", 6)} ${pad("cost", 9)}`,
+    `  ${pad("strategy", 23, "left")} ${pad("actor fresh", 12)} ${pad("cache read", 11)} ${pad("memory I/O", 13)} ${pad("max ctx", 9)} ${pad("safe/q", 8)} ${pad("cost", 9)}`,
   );
   for (const result of results) {
     const memory = `${formatTokens(result.memoryInput)}/${formatTokens(result.memoryOutput)}`;
+    const risk = `${result.overBudgetCalls}/${result.qualityRiskCalls}`;
     console.log(
-      `  ${pad(result.strategy, 23, "left")} ${pad(formatTokens(result.actorInput), 12)} ${pad(formatTokens(result.cacheRead), 11)} ${pad(memory, 13)} ${pad(formatTokens(result.maxContext), 9)} ${pad(result.overBudgetCalls, 6)} ${pad(formatMoney(result.totalCost), 9)}`,
+      `  ${pad(result.strategy, 23, "left")} ${pad(formatTokens(result.actorInput), 12)} ${pad(formatTokens(result.cacheRead), 11)} ${pad(memory, 13)} ${pad(formatTokens(result.maxContext), 9)} ${pad(risk, 8)} ${pad(formatMoney(result.totalCost), 9)}`,
     );
   }
 
@@ -107,20 +132,69 @@ function render() {
   }
 
   const [full, pi, om] = results;
-  const delta = om.totalCost - full.totalCost;
+  const conventional = full.totalCost <= pi.totalCost ? full : pi;
+  const delta = om.totalCost - conventional.totalCost;
   console.log(`\n${bold}What this run says${reset}`);
   console.log(
-    `  • Observational memory ${delta <= 0 ? "saves" : "costs"} ${formatMoney(Math.abs(delta))} vs modeled full replay and performs ${om.contractions} observation/reflection activations.`,
+    `  • Observational memory ${delta <= 0 ? "saves" : "costs"} ${formatMoney(Math.abs(delta))} vs ${conventional.strategy.toLowerCase()} and performs ${om.contractions} activations.`,
   );
   console.log(
-    `  • Pi performs ${pi.contractions} post-turn compactions; ${pi.overBudgetCalls} actor calls cross safe headroom before a legal post-run compaction point.`,
+    `  • Pi performs ${pi.contractions} post-turn compactions; ${pi.overBudgetCalls} calls cross safe headroom and ${pi.qualityRiskCalls} cross the quality-sensitive length.`,
   );
   console.log(
-    `  • Observational memory incurs ${om.hardWaits} hard wait${om.hardWaits === 1 ? "" : "s"} with the selected observer lag.`,
+    `  • OM incurs ${om.hardWaits} hard wait${om.hardWaits === 1 ? "" : "s"} and invalidates ${formatTokens(om.invalidatedPrefix)} cached-prefix tokens vs Pi's ${formatTokens(pi.invalidatedPrefix)}.`,
+  );
+}
+
+function renderSensitivity(state) {
+  const grid = breakEvenGrid(state.trace, state.config);
+  const robustness = robustnessSweep(state.trace, state.config);
+
+  console.log(`\n${bold}Break-even surface${reset}`);
+  console.log(
+    `  ${dim}Cells are OM cost delta vs the cheaper conventional strategy. “!” means an unsafe actor request.${reset}`,
+  );
+  console.log(
+    `  ${pad("obs output", 12, "left")}${OBSERVER_MULTIPLIERS.map((value) => pad(`${value}× rate`, 12)).join("")}${pad("break-even", 14)}`,
+  );
+  for (const row of grid.rows) {
+    const cells = row.cells.map((cell) => {
+      const marker = cell.safe ? "" : "!";
+      return pad(`${formatPercent(cell.deltaPercent)}${marker}`, 12);
+    }).join("");
+    const breakEven = Number.isFinite(row.breakEvenMultiplier)
+      ? `${row.breakEvenMultiplier.toFixed(2)}× rate`
+      : "no memory work";
+    console.log(
+      `  ${pad(`${(row.compression * 100).toFixed(0)}%`, 12, "left")}${cells}${pad(breakEven, 14)}`,
+    );
+  }
+  console.log(
+    `  ${dim}Columns sweep observer-model price relative to actor price; rows sweep observation size relative to retired raw source.${reset}`,
   );
 
+  console.log(`\n${bold}Robustness sweep${reset}`);
   console.log(
-    `\n${bold}[j/k]${reset}${dim} trace  ${reset}${bold}[p]${reset}${dim} policy  ${reset}${bold}[w]${reset}${dim} context window  ${reset}${bold}[d]${reset}${dim} observer lag  ${reset}${bold}[q]${reset}${dim} quit${reset}`,
+    `  ${robustness.cases.toLocaleString()} cases: 64k/128k/272k windows × 3 policies × 4 lags × 3 cache regimes × 4 observer prices × 3 compression ratios`,
+  );
+  console.log(
+    `  cheaper ${share(robustness.cheaper, robustness.cases)} · safe ${share(robustness.safe, robustness.cases)} · quality-length improvement ${share(robustness.qualityBetter, robustness.cases)} · no hard wait ${share(robustness.noHardWait, robustness.cases)}`,
+  );
+  console.log(
+    `  cost range: ${formatPercent(robustness.bestDelta)} best to ${formatPercent(robustness.worstDelta)} worst vs cheaper conventional strategy`,
+  );
+  console.log(
+    `\n  ${dim}This is sensitivity analysis, not evidence that a given compression ratio preserves task quality.${reset}`,
+  );
+}
+
+function render() {
+  const state = currentState();
+  renderHeader(state);
+  if (view === "outcome") renderOutcome(state);
+  else renderSensitivity(state);
+  console.log(
+    `\n${bold}[j/k]${reset}${dim} trace  ${reset}${bold}[p]${reset}${dim} policy  ${reset}${bold}[w]${reset}${dim} window  ${reset}${bold}[d]${reset}${dim} observer lag  ${reset}${bold}[s]${reset}${dim} outcome/sensitivity  ${reset}${bold}[q]${reset}${dim} quit${reset}`,
   );
 }
 
@@ -137,6 +211,7 @@ process.stdin.on("keypress", (_text, key) => {
   if (key.name === "p") policyIndex = rotate(policyIndex, 1, POLICY_PRESETS.length);
   if (key.name === "w") windowIndex = rotate(windowIndex, 1, windows.length);
   if (key.name === "d") delayIndex = rotate(delayIndex, 1, delays.length);
+  if (key.name === "s") view = view === "outcome" ? "sensitivity" : "outcome";
   render();
 });
 
