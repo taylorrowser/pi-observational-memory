@@ -48,6 +48,10 @@ _Avoid_: Patch chain, inferred task state
 The context supplied to the actor: active reflection, newer observations, newest active-task anchor, and the exact source-transcript tail not covered by observations.
 _Avoid_: Compaction summary, full transcript
 
+**Hard pause**:
+The state in which source or projected context has reached safe headroom and the next model request waits for a valid observational-memory projection. Exhausted retries or user cancellation ends the run without retiring exact source.
+_Avoid_: Compaction fallback, background delay
+
 **Completion**:
 A task state supported by explicit user confirmation or durable tool or artifact evidence. Intent, elapsed time, attempted work, or an unsupported assistant claim does not establish completion.
 _Avoid_: Assumed completion, inferred completion
