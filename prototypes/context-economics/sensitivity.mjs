@@ -64,7 +64,14 @@ export function breakEvenGrid(trace, config) {
 export function robustnessSweep(trace, config) {
   const windows = [64_000, 128_000, 272_000];
   const delays = [0, 2, 5, 10];
-  const cacheReuseFactors = [0, 0.5, 1];
+  const cacheRegimes = [
+    { cacheReuseFactor: 0, cacheWriteFraction: 0, group: "read-priced" },
+    { cacheReuseFactor: 0.5, cacheWriteFraction: 0, group: "read-priced" },
+    { cacheReuseFactor: 1, cacheWriteFraction: 0, group: "read-priced" },
+    { cacheReuseFactor: 0, cacheWriteFraction: 1, group: "explicit-write" },
+    { cacheReuseFactor: 0.5, cacheWriteFraction: 1, group: "explicit-write" },
+    { cacheReuseFactor: 1, cacheWriteFraction: 1, group: "explicit-write" },
+  ];
   const observerMultipliers = [0.1, 0.2, 0.5, 1];
   const compressionRatios = [0.08, 0.12, 0.25];
   let cases = 0;
@@ -73,19 +80,24 @@ export function robustnessSweep(trace, config) {
   let qualityPressureCases = 0;
   let qualityBetter = 0;
   let noHardWait = 0;
+  const cacheGroups = {
+    "read-priced": { cases: 0, cheaper: 0, deltaTotal: 0 },
+    "explicit-write": { cases: 0, cheaper: 0, deltaTotal: 0 },
+  };
   let bestDelta = Number.POSITIVE_INFINITY;
   let worstDelta = Number.NEGATIVE_INFINITY;
 
   for (const contextWindow of windows) {
     for (const policy of POLICY_PRESETS) {
       for (const observerDelayCalls of delays) {
-        for (const cacheReuseFactor of cacheReuseFactors) {
+        for (const cacheRegime of cacheRegimes) {
           const conventionalConfig = {
             ...config,
             ...resolvePolicy(policy, contextWindow - config.outputReserve),
             contextWindow,
             observerDelayCalls,
-            cacheReuseFactor,
+            cacheReuseFactor: cacheRegime.cacheReuseFactor,
+            cacheWriteFraction: cacheRegime.cacheWriteFraction,
           };
           const full = simulateFullReplay(trace, conventionalConfig);
           const pi = simulatePiCompaction(trace, conventionalConfig);
@@ -102,7 +114,11 @@ export function robustnessSweep(trace, config) {
                 ? 0
                 : ((om.totalCost - conventionalCost) / conventionalCost) * 100;
               cases += 1;
-              cheaper += Number(delta <= 0);
+              const isCheaper = Number(delta <= 0);
+              cheaper += isCheaper;
+              cacheGroups[cacheRegime.group].cases += 1;
+              cacheGroups[cacheRegime.group].cheaper += isCheaper;
+              cacheGroups[cacheRegime.group].deltaTotal += delta;
               safe += Number(om.overBudgetCalls === 0);
               if (conventionalQualityRisk > 0) {
                 qualityPressureCases += 1;
@@ -125,6 +141,7 @@ export function robustnessSweep(trace, config) {
     qualityPressureCases,
     qualityBetter,
     noHardWait,
+    cacheGroups,
     bestDelta,
     worstDelta,
   };

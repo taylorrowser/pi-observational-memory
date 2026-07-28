@@ -141,6 +141,11 @@ function emptyMetrics(strategy) {
     cacheWrite: 0,
     memoryInput: 0,
     memoryOutput: 0,
+    memoryCacheRead: 0,
+    memoryCacheWrite: 0,
+    memoryCalls: 0,
+    observationCalls: 0,
+    reflectionCalls: 0,
     actorCost: 0,
     memoryCost: 0,
     maxContext: 0,
@@ -166,9 +171,14 @@ function recordActor(metrics, bill, safeInput, qualityThreshold) {
   metrics.contextSeries.push(bill.totalInput);
 }
 
-function recordMemory(metrics, bill) {
-  metrics.memoryInput += bill.input + bill.cacheRead + bill.cacheWrite;
+function recordMemory(metrics, bill, kind) {
+  metrics.memoryInput += bill.input;
   metrics.memoryOutput += bill.output;
+  metrics.memoryCacheRead += bill.cacheRead;
+  metrics.memoryCacheWrite += bill.cacheWrite;
+  metrics.memoryCalls += 1;
+  metrics.observationCalls += Number(kind === "observation");
+  metrics.reflectionCalls += Number(kind === "reflection");
   metrics.memoryCost += bill.cost;
 }
 
@@ -256,7 +266,7 @@ export function simulatePiCompaction(trace, config) {
         config,
         rates: config.actorRates,
       });
-      recordMemory(metrics, memoryBill);
+      recordMemory(metrics, memoryBill, "compaction");
       summaryVersion += 1;
       summary = { id: `pi-summary-${summaryVersion}`, tokens: memoryOutput };
       raw = kept;
@@ -334,11 +344,11 @@ export function simulateObservationalMemory(trace, config) {
     const observerBill = billRequest({
       projection: observerProjection,
       previousProjection: previousObserverProjection,
-      outputTokens: observerOutput,
+      outputTokens: observerOutput + config.anchorTokens,
       config,
       rates: config.observerRates,
     });
-    recordMemory(metrics, observerBill);
+    recordMemory(metrics, observerBill, "observation");
     previousObserverProjection = observerProjection;
     observations.push({ id: `observation-${observationVersion}`, tokens: observerOutput });
     anchor = { id: `anchor-${observationVersion}`, tokens: config.anchorTokens };
@@ -368,7 +378,7 @@ export function simulateObservationalMemory(trace, config) {
         config,
         rates: config.observerRates,
       });
-      recordMemory(metrics, reflectionBill);
+      recordMemory(metrics, reflectionBill, "reflection");
       reflection = { id: `reflection-${reflectionVersion}`, tokens: reflectionOutput };
     }
   }
@@ -414,7 +424,13 @@ function finalize(metrics) {
   return {
     ...metrics,
     totalCost: metrics.actorCost + metrics.memoryCost,
-    totalInput: metrics.actorInput + metrics.cacheRead + metrics.cacheWrite + metrics.memoryInput,
+    totalInput:
+      metrics.actorInput +
+      metrics.cacheRead +
+      metrics.cacheWrite +
+      metrics.memoryInput +
+      metrics.memoryCacheRead +
+      metrics.memoryCacheWrite,
   };
 }
 

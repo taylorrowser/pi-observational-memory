@@ -118,14 +118,15 @@ function renderOutcome(state) {
 
   console.log(`\n${bold}Outcome${reset}`);
   console.log(
-    `  ${pad("strategy", 23, "left")} ${pad("actor fresh", 12)} ${pad("cache R/W", 13)} ${pad("memory I/O", 13)} ${pad("max ctx", 9)} ${pad("safe/q", 8)} ${pad("cost", 9)}`,
+    `  ${pad("strategy", 23, "left")} ${pad("actor I/O", 15)} ${pad("all cache R/W", 13)} ${pad("memory I/O", 13)} ${pad("calls", 7)} ${pad("max ctx", 9)} ${pad("safe/q", 8)} ${pad("cost", 9)}`,
   );
   for (const result of results) {
-    const cache = `${formatTokens(result.cacheRead)}/${formatTokens(result.cacheWrite)}`;
+    const actor = `${formatTokens(result.actorInput)}/${formatTokens(result.actorOutput)}`;
+    const cache = `${formatTokens(result.cacheRead + result.memoryCacheRead)}/${formatTokens(result.cacheWrite + result.memoryCacheWrite)}`;
     const memory = `${formatTokens(result.memoryInput)}/${formatTokens(result.memoryOutput)}`;
     const risk = `${result.overBudgetCalls}/${result.qualityRiskCalls}`;
     console.log(
-      `  ${pad(result.strategy, 23, "left")} ${pad(formatTokens(result.actorInput), 12)} ${pad(cache, 13)} ${pad(memory, 13)} ${pad(formatTokens(result.maxContext), 9)} ${pad(risk, 8)} ${pad(formatMoney(result.totalCost), 9)}`,
+      `  ${pad(result.strategy, 23, "left")} ${pad(actor, 15)} ${pad(cache, 13)} ${pad(memory, 13)} ${pad(result.memoryCalls, 7)} ${pad(formatTokens(result.maxContext), 9)} ${pad(risk, 8)} ${pad(formatMoney(result.totalCost), 9)}`,
     );
   }
 
@@ -147,7 +148,7 @@ function renderOutcome(state) {
     `  • Pi performs ${pi.contractions} post-turn compactions; ${pi.overBudgetCalls} calls cross safe headroom and ${pi.qualityRiskCalls} cross the quality-sensitive length.`,
   );
   console.log(
-    `  • OM incurs ${om.hardWaits} hard wait${om.hardWaits === 1 ? "" : "s"} and invalidates ${formatTokens(om.invalidatedPrefix)} cached-prefix tokens vs Pi's ${formatTokens(pi.invalidatedPrefix)}.`,
+    `  • OM uses ${om.observationCalls} observation + ${om.reflectionCalls} reflection calls, incurs ${om.hardWaits} hard wait${om.hardWaits === 1 ? "" : "s"}, and invalidates ${formatTokens(om.invalidatedPrefix)} cached-prefix tokens vs Pi's ${formatTokens(pi.invalidatedPrefix)}.`,
   );
 }
 
@@ -180,10 +181,15 @@ function renderSensitivity(state) {
 
   console.log(`\n${bold}Robustness sweep${reset}`);
   console.log(
-    `  ${robustness.cases.toLocaleString()} cases: 64k/128k/272k windows × 3 policies × 4 lags × 3 cache regimes × 4 observer prices × 3 compression ratios`,
+    `  ${robustness.cases.toLocaleString()} cases: 64k/128k/272k windows × 3 policies × 4 lags × 6 cache regimes × 4 observer prices × 3 compression ratios`,
   );
   console.log(
     `  cheaper ${share(robustness.cheaper, robustness.cases)} · safe ${share(robustness.safe, robustness.cases)} · quality-length improvement ${share(robustness.qualityBetter, robustness.qualityPressureCases)} of ${robustness.qualityPressureCases.toLocaleString()} pressured cases · no hard wait ${share(robustness.noHardWait, robustness.cases)}`,
+  );
+  const readPriced = robustness.cacheGroups["read-priced"];
+  const explicitWrite = robustness.cacheGroups["explicit-write"];
+  console.log(
+    `  mean cost delta by cache accounting: ${formatPercent(readPriced.deltaTotal / readPriced.cases, 1)} without explicit writes · ${formatPercent(explicitWrite.deltaTotal / explicitWrite.cases, 1)} with explicit writes`,
   );
   console.log(
     `  cost range: ${formatPercent(robustness.bestDelta)} best to ${formatPercent(robustness.worstDelta)} worst vs cheaper conventional strategy`,
