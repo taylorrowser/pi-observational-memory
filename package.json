@@ -23,6 +23,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke": "npm run build && node scripts/smoke-load.mjs",
+    "pi-core:check": "node scripts/check-pi-core.mjs",
     "check": "npm run typecheck && npm test && npm run smoke"
   },
   "pi": {
