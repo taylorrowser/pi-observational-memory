@@ -57,12 +57,13 @@ describe("Pi SessionMemory host", () => {
     const pi = { appendEntry: vi.fn() } as unknown as ExtensionAPI;
     const host = createPiHost(pi, () => context, completeModel);
     const sourceEntry = {
-      type: "custom",
+      type: "branch_summary",
       id: "entry-1",
       parentId: null,
       timestamp: "2026-01-01T00:00:00.000Z",
-      customType: "fixture",
-      data: { exact: "source" },
+      fromId: "abandoned-leaf",
+      summary: "Approach A may have completed the migration.",
+      fromHook: true,
     } satisfies SessionEntry;
     const request: ObservationRequest = {
       passId: "session-1:observation:1",
@@ -94,11 +95,15 @@ describe("Pi SessionMemory host", () => {
     expect(completeModel).toHaveBeenCalledWith(
       model,
       expect.objectContaining({
-        systemPrompt: expect.stringContaining("observational-memory.observation"),
+        systemPrompt: expect.stringMatching(
+          /branch_summary[\s\S]*derived orientation[\s\S]*not exact\s+source evidence[\s\S]*completion or action-sensitive details/,
+        ),
         messages: [
           expect.objectContaining({
             role: "user",
-            content: expect.stringContaining('"id":"entry-1"'),
+            content: expect.stringMatching(
+              /"id":"entry-1"[\s\S]*"fromId":"abandoned-leaf"[\s\S]*"fromHook":true/,
+            ),
           }),
         ],
       }),

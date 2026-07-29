@@ -494,6 +494,7 @@ describe("SessionMemory reflection", () => {
         activeMemory: {
           reflectedHistory: ["REFLECTION 1: coherent folded history."],
           observations: ["OBSERVATION 3: durable outcome 3."],
+          derivedOrientations: [],
           activeTask: activeTask(3),
         },
         source: expect.objectContaining({
@@ -863,11 +864,14 @@ describe("SessionMemory reflection", () => {
       ],
     };
     let resolveReflection!: (value: ReturnType<typeof reflectionCandidate>) => void;
+    let reflectionSignal: AbortSignal | undefined;
     const completeReflection = vi.fn(
-      () =>
-        new Promise<ReturnType<typeof reflectionCandidate>>((resolve) => {
+      (_request: unknown, signal?: AbortSignal) => {
+        reflectionSignal = signal;
+        return new Promise<ReturnType<typeof reflectionCandidate>>((resolve) => {
           resolveReflection = resolve;
-        }),
+        });
+      },
     );
     const appendEntry = vi.fn();
     const attributeUsage = vi.fn();
@@ -887,6 +891,7 @@ describe("SessionMemory reflection", () => {
     const projection = memory.project(launchSnapshot, history.messages);
     await vi.waitFor(() => expect(completeReflection).toHaveBeenCalledOnce());
     memory.restore(siblingSnapshot);
+    expect(reflectionSignal?.aborted).toBe(true);
     resolveReflection(
       reflectionCandidate([
         "session-1:observation:1",
