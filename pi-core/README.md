@@ -8,11 +8,20 @@
 
 It adds `pi.appendUsage(...)`, a persisted, non-model-visible `extension_usage` session-ledger entry, and aggregates those entries through session/RPC statistics, the footer, usage breakdowns, and HTML exports. It also preserves an overflow-error response when an extension cancels automatic compaction, removing that response only after successful compact-and-retry recovery.
 
-Run the reproducible verification from this repository:
+Run the reproducible core verification from this repository:
 
 ```bash
 npm run pi-core:check
 ```
+
+To build the extension and patched runtime together, load them through Pi's real SDK runtime, and produce paired acceptance evidence, run:
+
+```bash
+npm ci
+npm run acceptance
+```
+
+The published unpatched Pi 0.81.1 package does not provide the required usage ledger seam; the acceptance command always applies this pinned patch before loading the extension for model-backed scenarios.
 
 The command clones the pinned source into `.cache/`, hydrates the exact published `@earendil-works/pi-ai@0.81.1` model data, applies the patch, type-checks it, runs the affected integration tests, and builds the affected Pi packages without regenerating model data from live catalogs.
 
