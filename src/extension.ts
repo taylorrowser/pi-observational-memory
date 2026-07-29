@@ -48,6 +48,12 @@ export function registerObservationalMemory(
     memory.restore(snapshot(context));
   });
 
+  pi.on("session_tree", (_event, context) => {
+    if (!memory) return;
+    currentContext = context;
+    memory.restore(snapshot(context));
+  });
+
   pi.on("turn_end", (_event, context) => {
     currentContext = context;
     memory?.observe(snapshot(context), context.signal);

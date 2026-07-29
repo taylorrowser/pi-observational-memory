@@ -59,6 +59,7 @@ export interface ObservationRequest {
   readonly activeMemory?: {
     readonly reflectedHistory?: readonly string[];
     readonly observations: readonly string[];
+    readonly derivedOrientations: readonly DerivedOrientation[];
     readonly activeTask: ActiveTaskAnchor;
   };
   readonly source: {
@@ -79,6 +80,7 @@ export interface ReflectionObservation {
   readonly id: string;
   readonly timestamp: string;
   readonly observations: readonly string[];
+  readonly derivedOrientations: readonly DerivedOrientation[];
 }
 
 export interface ReflectionRequest {
@@ -115,6 +117,14 @@ interface ActiveTaskAnchor {
   };
 }
 
+export interface DerivedOrientation {
+  readonly evidenceStatus: "derived-orientation";
+  readonly sourceEntryId: string;
+  readonly fromEntryId: string;
+  readonly producer: "pi" | "extension";
+  readonly summary: string;
+}
+
 interface ObservationCommit {
   readonly protocol: "observational-memory.observation";
   readonly version: 1;
@@ -127,6 +137,7 @@ interface ObservationCommit {
     readonly endEntryId: string;
   };
   readonly observations: readonly string[];
+  readonly derivedOrientations: readonly DerivedOrientation[];
   readonly activeTask: ActiveTaskAnchor;
   readonly lineage: { readonly parentCommitId: string | null };
   readonly producer: { readonly provider: string; readonly model: string };
@@ -243,6 +254,25 @@ function sourceEntries(ancestry: readonly SessionEntry[]): SessionEntry[] {
   return ancestry.filter(
     (entry) => !isObservationEntry(entry) && !isReflectionEntry(entry),
   );
+}
+
+function derivedOrientations(
+  entries: readonly SessionEntry[],
+): DerivedOrientation[] {
+  return entries
+    .filter(
+      (
+        entry,
+      ): entry is Extract<SessionEntry, { type: "branch_summary" }> =>
+        entry.type === "branch_summary",
+    )
+    .map((entry) => ({
+      evidenceStatus: "derived-orientation",
+      sourceEntryId: entry.id,
+      fromEntryId: entry.fromId,
+      producer: entry.fromHook ? "extension" : "pi",
+      summary: entry.summary,
+    }));
 }
 
 function entryMessages(entry: SessionEntry): ContextEvent["messages"] {
@@ -453,6 +483,7 @@ function parseCandidate(
       endEntryId: lastEntry.id,
     },
     observations,
+    derivedOrientations: derivedOrientations(request.source.entries),
     activeTask,
     lineage: { parentCommitId: expectedParentCommitId },
     producer: { provider: response.provider, model: response.model },
@@ -470,6 +501,7 @@ function parseCandidate(
         "parent-lineage",
         "contiguous-coverage",
         "complete-active-task",
+        "derived-orientation-provenance",
       ],
     },
   };
@@ -643,9 +675,22 @@ function isUsage(value: unknown): value is ExtensionUsageAttribution["usage"] {
   );
 }
 
+function hasStableMemoryIdentity(
+  value: Record<string, unknown>,
+  operation: "observation" | "reflection",
+): value is Record<string, unknown> & { id: string; replayEpoch: string } {
+  if (!isNonemptyString(value.id) || !isNonemptyString(value.replayEpoch)) {
+    return false;
+  }
+  const prefix = `${value.replayEpoch}:${operation}:`;
+  return (
+    value.id.startsWith(prefix) &&
+    /^[1-9]\d*$/.test(value.id.slice(prefix.length))
+  );
+}
+
 function parsePersistedCommit(
   value: unknown,
-  sessionId: string,
   expectedParentCommitId: string | null,
   expectedSource: readonly SessionEntry[],
 ): ObservationCommit | undefined {
@@ -665,8 +710,7 @@ function parsePersistedCommit(
   if (
     value.protocol !== "observational-memory.observation" ||
     value.version !== 1 ||
-    !isNonemptyString(value.id) ||
-    value.replayEpoch !== sessionId ||
+    !hasStableMemoryIdentity(value, "observation") ||
     value.parentCommitId !== expectedParentCommitId ||
     value.lineage.parentCommitId !== expectedParentCommitId ||
     !isStringArray(entryIds) ||
@@ -696,7 +740,7 @@ function parsePersistedCommit(
     protocol: "observational-memory.observation",
     version: 1,
     id: value.id,
-    replayEpoch: sessionId,
+    replayEpoch: value.replayEpoch,
     parentCommitId: expectedParentCommitId,
     coverage: {
       entryIds: expectedSource.map((entry) => entry.id),
@@ -704,6 +748,7 @@ function parsePersistedCommit(
       endEntryId: expectedSource.at(-1)!.id,
     },
     observations,
+    derivedOrientations: derivedOrientations(expectedSource),
     activeTask,
     lineage: { parentCommitId: expectedParentCommitId },
     producer: {
@@ -724,7 +769,6 @@ function parsePersistedCommit(
 
 function parsePersistedReflection(
   value: unknown,
-  sessionId: string,
   activeReflection: ReflectionGeneration | undefined,
   expectedObservations: readonly ObservationCommit[],
 ): ReflectionGeneration | undefined {
@@ -749,8 +793,7 @@ function parsePersistedReflection(
   if (
     value.protocol !== "observational-memory.reflection" ||
     value.version !== 1 ||
-    !isNonemptyString(value.id) ||
-    value.replayEpoch !== sessionId ||
+    !hasStableMemoryIdentity(value, "reflection") ||
     value.parentReflectionId !== expectedParentReflectionId ||
     value.lineage.parentReflectionId !== expectedParentReflectionId ||
     !isStringArray(observationIds) ||
@@ -788,7 +831,7 @@ function parsePersistedReflection(
     protocol: "observational-memory.reflection",
     version: 1,
     id: value.id,
-    replayEpoch: sessionId,
+    replayEpoch: value.replayEpoch,
     parentReflectionId: expectedParentReflectionId,
     coverage: {
       observationIds: expectedObservations.map((observation) => observation.id),
@@ -826,9 +869,12 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
   let observationEntryCount = 0;
   let reflectionEntryCount = 0;
 
-  for (const entry of snapshot.ancestry) {
+  for (const [index, entry] of snapshot.ancestry.entries()) {
+    const expectedPhysicalParentId = snapshot.ancestry[index - 1]?.id ?? null;
+    const isPhysicallyContiguous = entry.parentId === expectedPhysicalParentId;
     if (isObservationEntry(entry)) {
       observationEntryCount += 1;
+      if (!isPhysicallyContiguous) continue;
       const data = entry.data;
       const coverage =
         isRecord(data) && isRecord(data.coverage)
@@ -841,7 +887,6 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
       );
       const candidate = parsePersistedCommit(
         data,
-        snapshot.sessionId,
         commits.at(-1)?.id ?? null,
         expectedSource,
       );
@@ -856,6 +901,7 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
 
     if (isReflectionEntry(entry)) {
       reflectionEntryCount += 1;
+      if (!isPhysicallyContiguous) continue;
       const data = entry.data;
       const coverage =
         isRecord(data) && isRecord(data.coverage)
@@ -870,7 +916,6 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
       );
       const candidate = parsePersistedReflection(
         data,
-        snapshot.sessionId,
         activeReflection,
         expectedObservations,
       );
@@ -923,6 +968,9 @@ function renderMemory(
   const newest = commits.at(-1);
   if (!newest) throw new Error("Cannot render empty observational memory");
   const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
+  const orientations = commits.flatMap(
+    (commit) => commit.derivedOrientations,
+  );
   return {
     role: "user",
     content: `<observational-memory version="1">\n${JSON.stringify({
@@ -932,6 +980,9 @@ function renderMemory(
       observations: commits
         .slice(foldedCount)
         .flatMap((commit) => commit.observations),
+      ...(orientations.length > 0
+        ? { derivedOrientations: orientations }
+        : {}),
       activeTask: newest.activeTask,
     })}\n</observational-memory>`,
     timestamp: 0,
@@ -990,6 +1041,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
         id: commit.id,
         timestamp: commit.timestamp,
         observations: commit.observations,
+        derivedOrientations: commit.derivedOrientations,
       })),
     };
 
@@ -1025,8 +1077,10 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
       // Below hard pressure, prior memory and exact source remain authoritative.
     } finally {
       signal?.removeEventListener("abort", abort);
-      if (runningController === controller) runningController = undefined;
-      running = false;
+      if (runningController === controller) {
+        runningController = undefined;
+        running = false;
+      }
     }
   }
 
@@ -1035,6 +1089,9 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
       if (disposed) return;
       lifecycleRevision += 1;
       ready = undefined;
+      runningController?.abort("session ancestry restored");
+      runningController = undefined;
+      running = false;
       const replayed = replayMemory(snapshot);
       activeCommits = replayed.commits;
       activeReflections = replayed.reflections;
@@ -1085,6 +1142,9 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
                 observations: activeCommits
                   .slice(foldedCount)
                   .flatMap((commit) => commit.observations),
+                derivedOrientations: activeCommits.flatMap(
+                  (commit) => commit.derivedOrientations,
+                ),
                 activeTask: newestCommit.activeTask,
               },
             }
@@ -1114,8 +1174,10 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
         .catch(() => {})
         .finally(() => {
           signal?.removeEventListener("abort", abort);
-          if (runningController === controller) runningController = undefined;
-          running = false;
+          if (runningController === controller) {
+            runningController = undefined;
+            running = false;
+          }
         });
     },
 

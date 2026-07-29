@@ -6,6 +6,8 @@ The extension watches completed model steps and remains inert below a built-in s
 
 The built-in policy derives every threshold from the actor model's usable input budget: raw target 50%, soft pressure 60%, hard pressure 85%, observation target 15%, and observation high pressure 25%. Observer and Reflector output budgets are capped at 10% of usable input or the model's maximum output, whichever is smaller.
 
+The selected root-to-leaf Pi ancestry is the sole replay authority. Successful tree navigation cancels obsolete work and reconstructs the destination immediately, so sibling or abandoned memory cannot leak. A Pi branch summary is the only explicit cross-branch handoff; when covered, it remains structurally labeled as derived orientation with its source and producer provenance, never exact completion evidence. Forks and clones preserve copied committed identities and provenance, while all new work binds to the child session and no in-memory pass migrates.
+
 Standalone Observer and Reflector usage is attributed through the pinned Pi core capability documented in [`pi-core/README.md`](pi-core/README.md).
 
 ## Development
