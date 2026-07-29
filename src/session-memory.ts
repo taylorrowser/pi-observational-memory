@@ -24,6 +24,7 @@ export interface SessionMemory {
   project(
     snapshot: SessionSnapshot,
     messages: ContextEvent["messages"],
+    signal?: AbortSignal,
   ): Promise<ContextEvent["messages"]>;
   dispose(): void;
 }
@@ -51,8 +52,12 @@ export interface ObservationRequest {
     readonly soft: number;
     readonly hard: number;
     readonly observationOutputBudget: number;
+    readonly observationTarget: number;
+    readonly observationHigh: number;
+    readonly reflectionOutputBudget: number;
   };
   readonly activeMemory?: {
+    readonly reflectedHistory?: readonly string[];
     readonly observations: readonly string[];
     readonly activeTask: ActiveTaskAnchor;
   };
@@ -69,6 +74,27 @@ export interface ObservationResponse {
   readonly model: string;
   readonly stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
 }
+
+export interface ReflectionObservation {
+  readonly id: string;
+  readonly timestamp: string;
+  readonly observations: readonly string[];
+}
+
+export interface ReflectionRequest {
+  readonly passId: string;
+  readonly actor: ActorModel;
+  readonly pressure: ObservationRequest["pressure"];
+  readonly parentReflection: {
+    readonly id: string;
+    readonly reflectedHistory: readonly string[];
+    readonly foldedObservationIds: readonly string[];
+  } | null;
+  readonly coverage: { readonly observationIds: readonly string[] };
+  readonly observations: readonly ReflectionObservation[];
+}
+
+export type ReflectionResponse = ObservationResponse;
 
 interface VerifiedProgress {
   readonly claim: string;
@@ -115,6 +141,32 @@ interface ObservationCommit {
   };
 }
 
+interface ReflectionGeneration {
+  readonly protocol: "observational-memory.reflection";
+  readonly version: 1;
+  readonly id: string;
+  readonly replayEpoch: string;
+  readonly parentReflectionId: string | null;
+  readonly coverage: {
+    readonly observationIds: readonly string[];
+    readonly startObservationId: string;
+    readonly endObservationId: string;
+  };
+  readonly foldedObservationIds: readonly string[];
+  readonly reflectedHistory: readonly string[];
+  readonly lineage: { readonly parentReflectionId: string | null };
+  readonly producer: { readonly provider: string; readonly model: string };
+  readonly usage: ExtensionUsageAttribution["usage"];
+  readonly timestamp: string;
+  readonly fidelity: "normal";
+  readonly promptVersion: 1;
+  readonly outputEstimate: number;
+  readonly validation: {
+    readonly version: 1;
+    readonly checks: readonly string[];
+  };
+}
+
 interface ReadyObservation {
   readonly sessionId: string;
   readonly launchLeafId: string | null;
@@ -130,13 +182,20 @@ export interface SessionMemoryHost {
     request: ObservationRequest,
     signal?: AbortSignal,
   ): Promise<ObservationResponse>;
+  completeReflection?(
+    request: ReflectionRequest,
+    signal?: AbortSignal,
+  ): Promise<ReflectionResponse>;
 }
 
 const RAW_TARGET_RATIO = 0.5;
 const SOFT_PRESSURE_RATIO = 0.6;
 const HARD_PRESSURE_RATIO = 0.85;
 const OBSERVATION_OUTPUT_RATIO = 0.1;
+const OBSERVATION_TARGET_RATIO = 0.15;
+const OBSERVATION_HIGH_RATIO = 0.25;
 const OBSERVATION_CUSTOM_TYPE = "observational-memory:observation";
+const REFLECTION_CUSTOM_TYPE = "observational-memory:reflection";
 
 function pressurePolicy(actor: ActorModel): ObservationRequest["pressure"] {
   const usableInput = Math.max(1, actor.contextWindow - actor.maxTokens);
@@ -149,17 +208,41 @@ function pressurePolicy(actor: ActorModel): ObservationRequest["pressure"] {
       actor.maxTokens,
       Math.max(1, Math.floor(usableInput * OBSERVATION_OUTPUT_RATIO)),
     ),
+    observationTarget: Math.max(
+      1,
+      Math.floor(usableInput * OBSERVATION_TARGET_RATIO),
+    ),
+    observationHigh: Math.max(
+      1,
+      Math.floor(usableInput * OBSERVATION_HIGH_RATIO),
+    ),
+    reflectionOutputBudget: Math.min(
+      actor.maxTokens,
+      Math.max(1, Math.floor(usableInput * OBSERVATION_OUTPUT_RATIO)),
+    ),
   };
 }
 
 function isObservationEntry(
   entry: SessionEntry,
-): entry is Extract<SessionEntry, { type: "custom" }> {
+): entry is Extract<SessionEntry, { type: "custom" }> & {
+  readonly customType: typeof OBSERVATION_CUSTOM_TYPE;
+} {
   return entry.type === "custom" && entry.customType === OBSERVATION_CUSTOM_TYPE;
 }
 
+function isReflectionEntry(
+  entry: SessionEntry,
+): entry is Extract<SessionEntry, { type: "custom" }> & {
+  readonly customType: typeof REFLECTION_CUSTOM_TYPE;
+} {
+  return entry.type === "custom" && entry.customType === REFLECTION_CUSTOM_TYPE;
+}
+
 function sourceEntries(ancestry: readonly SessionEntry[]): SessionEntry[] {
-  return ancestry.filter((entry) => !isObservationEntry(entry));
+  return ancestry.filter(
+    (entry) => !isObservationEntry(entry) && !isReflectionEntry(entry),
+  );
 }
 
 function entryMessages(entry: SessionEntry): ContextEvent["messages"] {
@@ -392,6 +475,161 @@ function parseCandidate(
   };
 }
 
+function observationLayerTokens(
+  host: SessionMemoryHost,
+  commits: readonly ObservationCommit[],
+): number {
+  if (commits.length === 0) return 0;
+  return host.estimateTokens([
+    {
+      role: "user",
+      content: JSON.stringify(
+        commits.flatMap((commit) => commit.observations),
+      ),
+      timestamp: 0,
+    },
+  ]);
+}
+
+function reflectionPrefix(
+  host: SessionMemoryHost,
+  actor: ActorModel,
+  commits: readonly ObservationCommit[],
+  activeReflection: ReflectionGeneration | undefined,
+): ObservationCommit[] | undefined {
+  const policy = pressurePolicy(actor);
+  const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
+  const activeObservations = commits.slice(foldedCount);
+  if (observationLayerTokens(host, activeObservations) < policy.observationHigh) {
+    return undefined;
+  }
+
+  for (let count = 1; count <= activeObservations.length; count += 1) {
+    if (
+      observationLayerTokens(host, activeObservations.slice(count)) <=
+      policy.observationTarget
+    ) {
+      return activeObservations.slice(0, count);
+    }
+  }
+  return activeObservations;
+}
+
+function safeProjectionCommits(
+  host: SessionMemoryHost,
+  actor: ActorModel,
+  commits: readonly ObservationCommit[],
+  activeReflection: ReflectionGeneration | undefined,
+): ObservationCommit[] {
+  const policy = pressurePolicy(actor);
+  const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
+  let visibleCount = foldedCount;
+
+  for (let index = foldedCount; index < commits.length; index += 1) {
+    const candidate = commits.slice(foldedCount, index + 1);
+    if (observationLayerTokens(host, candidate) >= policy.observationHigh) break;
+    visibleCount = index + 1;
+  }
+
+  return commits.slice(0, visibleCount);
+}
+
+function parseReflectionCandidate(
+  host: SessionMemoryHost,
+  request: ReflectionRequest,
+  response: ReflectionResponse,
+  activeReflection: ReflectionGeneration | undefined,
+): ReflectionGeneration | undefined {
+  host.attributeUsage({
+    usage: response.usage,
+    provider: response.provider,
+    model: response.model,
+    operation: "observational-memory:reflection",
+    passId: request.passId,
+  });
+
+  if (
+    response.stopReason !== "stop" ||
+    !response.text.trim() ||
+    response.provider !== request.actor.provider ||
+    response.model !== request.actor.model
+  ) {
+    return undefined;
+  }
+
+  let candidate: unknown;
+  try {
+    candidate = JSON.parse(response.text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(candidate) || !isRecord(candidate.coverage)) return undefined;
+
+  const observationIds = candidate.coverage.observationIds;
+  const reflectedHistory = candidate.reflectedHistory;
+  const expectedParentReflectionId = activeReflection?.id ?? null;
+  if (
+    candidate.protocol !== "observational-memory.reflection" ||
+    candidate.version !== 1 ||
+    candidate.passId !== request.passId ||
+    candidate.parentReflectionId !== expectedParentReflectionId ||
+    !isStringArray(observationIds) ||
+    observationIds.length !== request.coverage.observationIds.length ||
+    !observationIds.every(
+      (observationId, index) =>
+        observationId === request.coverage.observationIds[index],
+    ) ||
+    !isStringArray(reflectedHistory) ||
+    reflectedHistory.length === 0
+  ) {
+    return undefined;
+  }
+
+  const outputEstimate = host.estimateTokens([
+    { role: "user", content: response.text, timestamp: 0 },
+  ]);
+  if (outputEstimate > request.pressure.reflectionOutputBudget) return undefined;
+  const firstObservation = request.observations[0];
+  const lastObservation = request.observations.at(-1);
+  if (!firstObservation || !lastObservation) return undefined;
+
+  return {
+    protocol: "observational-memory.reflection",
+    version: 1,
+    id: request.passId,
+    replayEpoch: request.passId.split(":reflection:")[0] ?? request.passId,
+    parentReflectionId: expectedParentReflectionId,
+    coverage: {
+      observationIds: [...request.coverage.observationIds],
+      startObservationId: firstObservation.id,
+      endObservationId: lastObservation.id,
+    },
+    foldedObservationIds: [
+      ...(activeReflection?.foldedObservationIds ?? []),
+      ...request.coverage.observationIds,
+    ],
+    reflectedHistory,
+    lineage: { parentReflectionId: expectedParentReflectionId },
+    producer: { provider: response.provider, model: response.model },
+    usage: response.usage,
+    timestamp: lastObservation.timestamp,
+    fidelity: "normal",
+    promptVersion: 1,
+    outputEstimate,
+    validation: {
+      version: 1,
+      checks: [
+        "protocol",
+        "complete-response",
+        "output-budget",
+        "parent-lineage",
+        "contiguous-observation-coverage",
+        "nonempty-history",
+      ],
+    },
+  };
+}
+
 function isUsage(value: unknown): value is ExtensionUsageAttribution["usage"] {
   if (!isRecord(value) || !isRecord(value.cost)) return false;
   const cost = value.cost;
@@ -484,39 +722,171 @@ function parsePersistedCommit(
   };
 }
 
-function replayObservations(snapshot: SessionSnapshot): ObservationCommit[] {
+function parsePersistedReflection(
+  value: unknown,
+  sessionId: string,
+  activeReflection: ReflectionGeneration | undefined,
+  expectedObservations: readonly ObservationCommit[],
+): ReflectionGeneration | undefined {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.coverage) ||
+    !isRecord(value.lineage) ||
+    !isRecord(value.producer) ||
+    !isRecord(value.validation)
+  ) {
+    return undefined;
+  }
+  const observationIds = value.coverage.observationIds;
+  const foldedObservationIds = value.foldedObservationIds;
+  const reflectedHistory = value.reflectedHistory;
+  const validationChecks = value.validation.checks;
+  const expectedParentReflectionId = activeReflection?.id ?? null;
+  const expectedFoldedObservationIds = [
+    ...(activeReflection?.foldedObservationIds ?? []),
+    ...expectedObservations.map((observation) => observation.id),
+  ];
+  if (
+    value.protocol !== "observational-memory.reflection" ||
+    value.version !== 1 ||
+    !isNonemptyString(value.id) ||
+    value.replayEpoch !== sessionId ||
+    value.parentReflectionId !== expectedParentReflectionId ||
+    value.lineage.parentReflectionId !== expectedParentReflectionId ||
+    !isStringArray(observationIds) ||
+    observationIds.length === 0 ||
+    observationIds.length !== expectedObservations.length ||
+    !observationIds.every(
+      (observationId, index) =>
+        observationId === expectedObservations[index]?.id,
+    ) ||
+    !isStringArray(foldedObservationIds) ||
+    foldedObservationIds.length !== expectedFoldedObservationIds.length ||
+    !foldedObservationIds.every(
+      (observationId, index) =>
+        observationId === expectedFoldedObservationIds[index],
+    ) ||
+    value.coverage.startObservationId !== expectedObservations[0]?.id ||
+    value.coverage.endObservationId !== expectedObservations.at(-1)?.id ||
+    !isStringArray(reflectedHistory) ||
+    reflectedHistory.length === 0 ||
+    !isNonemptyString(value.producer.provider) ||
+    !isNonemptyString(value.producer.model) ||
+    !isUsage(value.usage) ||
+    !isNonemptyString(value.timestamp) ||
+    value.fidelity !== "normal" ||
+    value.promptVersion !== 1 ||
+    typeof value.outputEstimate !== "number" ||
+    value.outputEstimate < 0 ||
+    value.validation.version !== 1 ||
+    !isStringArray(validationChecks)
+  ) {
+    return undefined;
+  }
+
+  return {
+    protocol: "observational-memory.reflection",
+    version: 1,
+    id: value.id,
+    replayEpoch: sessionId,
+    parentReflectionId: expectedParentReflectionId,
+    coverage: {
+      observationIds: expectedObservations.map((observation) => observation.id),
+      startObservationId: expectedObservations[0]!.id,
+      endObservationId: expectedObservations.at(-1)!.id,
+    },
+    foldedObservationIds: expectedFoldedObservationIds,
+    reflectedHistory,
+    lineage: { parentReflectionId: expectedParentReflectionId },
+    producer: {
+      provider: value.producer.provider,
+      model: value.producer.model,
+    },
+    usage: value.usage,
+    timestamp: value.timestamp,
+    fidelity: "normal",
+    promptVersion: 1,
+    outputEstimate: value.outputEstimate,
+    validation: { version: 1, checks: validationChecks },
+  };
+}
+
+interface ReplayedMemory {
+  readonly commits: ObservationCommit[];
+  readonly reflections: ReflectionGeneration[];
+  readonly observationEntryCount: number;
+  readonly reflectionEntryCount: number;
+}
+
+function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
   const seenSource: SessionEntry[] = [];
   const commits: ObservationCommit[] = [];
+  const reflections: ReflectionGeneration[] = [];
   let coveredCount = 0;
+  let observationEntryCount = 0;
+  let reflectionEntryCount = 0;
 
   for (const entry of snapshot.ancestry) {
-    if (!isObservationEntry(entry)) {
-      seenSource.push(entry);
+    if (isObservationEntry(entry)) {
+      observationEntryCount += 1;
+      const data = entry.data;
+      const coverage =
+        isRecord(data) && isRecord(data.coverage)
+          ? data.coverage.entryIds
+          : undefined;
+      if (!Array.isArray(coverage) || coverage.length === 0) continue;
+      const expectedSource = seenSource.slice(
+        coveredCount,
+        coveredCount + coverage.length,
+      );
+      const candidate = parsePersistedCommit(
+        data,
+        snapshot.sessionId,
+        commits.at(-1)?.id ?? null,
+        expectedSource,
+      );
+      if (!candidate) continue;
+      const endIndex = coveredCount + candidate.coverage.entryIds.length - 1;
+      if (!completedStepBoundaries(seenSource).includes(endIndex)) continue;
+
+      coveredCount += candidate.coverage.entryIds.length;
+      commits.push(candidate);
       continue;
     }
 
-    const data = entry.data;
-    const coverage =
-      isRecord(data) && isRecord(data.coverage)
-        ? data.coverage.entryIds
-        : undefined;
-    if (!Array.isArray(coverage) || coverage.length === 0) continue;
-    const expectedSource = seenSource.slice(coveredCount, coveredCount + coverage.length);
-    const candidate = parsePersistedCommit(
-      data,
-      snapshot.sessionId,
-      commits.at(-1)?.id ?? null,
-      expectedSource,
-    );
-    if (!candidate) continue;
-    const endIndex = coveredCount + candidate.coverage.entryIds.length - 1;
-    if (!completedStepBoundaries(seenSource).includes(endIndex)) continue;
+    if (isReflectionEntry(entry)) {
+      reflectionEntryCount += 1;
+      const data = entry.data;
+      const coverage =
+        isRecord(data) && isRecord(data.coverage)
+          ? data.coverage.observationIds
+          : undefined;
+      if (!Array.isArray(coverage) || coverage.length === 0) continue;
+      const activeReflection = reflections.at(-1);
+      const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
+      const expectedObservations = commits.slice(
+        foldedCount,
+        foldedCount + coverage.length,
+      );
+      const candidate = parsePersistedReflection(
+        data,
+        snapshot.sessionId,
+        activeReflection,
+        expectedObservations,
+      );
+      if (candidate) reflections.push(candidate);
+      continue;
+    }
 
-    coveredCount += candidate.coverage.entryIds.length;
-    commits.push(candidate);
+    seenSource.push(entry);
   }
 
-  return commits;
+  return {
+    commits,
+    reflections,
+    observationEntryCount,
+    reflectionEntryCount,
+  };
 }
 
 function sameMessage(
@@ -548,13 +918,20 @@ function findUniqueSequence(
 
 function renderMemory(
   commits: readonly ObservationCommit[],
+  activeReflection?: ReflectionGeneration,
 ): ContextEvent["messages"][number] {
   const newest = commits.at(-1);
   if (!newest) throw new Error("Cannot render empty observational memory");
+  const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
   return {
     role: "user",
     content: `<observational-memory version="1">\n${JSON.stringify({
-      observations: commits.flatMap((commit) => commit.observations),
+      ...(activeReflection
+        ? { reflectedHistory: activeReflection.reflectedHistory }
+        : {}),
+      observations: commits
+        .slice(foldedCount)
+        .flatMap((commit) => commit.observations),
       activeTask: newest.activeTask,
     })}\n</observational-memory>`,
     timestamp: 0,
@@ -566,19 +943,118 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
   let running = false;
   let runningController: AbortController | undefined;
   let passNumber = 0;
+  let reflectionPassNumber = 0;
   let ready: ReadyObservation | undefined;
   let activeCommits: ObservationCommit[] = [];
+  let activeReflections: ReflectionGeneration[] = [];
+  let lifecycleRevision = 0;
+
+  async function reflectIfRequired(
+    snapshot: SessionSnapshot,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const activeReflection = activeReflections.at(-1);
+    const prefix = snapshot.actor
+      ? reflectionPrefix(host, snapshot.actor, activeCommits, activeReflection)
+      : undefined;
+    if (
+      !prefix ||
+      !snapshot.actor ||
+      !host.completeReflection ||
+      running ||
+      signal?.aborted
+    ) {
+      return;
+    }
+
+    running = true;
+    const launchRevision = lifecycleRevision;
+    const controller = new AbortController();
+    runningController = controller;
+    const abort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    reflectionPassNumber += 1;
+    const request: ReflectionRequest = {
+      passId: `${snapshot.sessionId}:reflection:${reflectionPassNumber}`,
+      actor: snapshot.actor,
+      pressure: pressurePolicy(snapshot.actor),
+      parentReflection: activeReflection
+        ? {
+            id: activeReflection.id,
+            reflectedHistory: activeReflection.reflectedHistory,
+            foldedObservationIds: activeReflection.foldedObservationIds,
+          }
+        : null,
+      coverage: { observationIds: prefix.map((commit) => commit.id) },
+      observations: prefix.map((commit) => ({
+        id: commit.id,
+        timestamp: commit.timestamp,
+        observations: commit.observations,
+      })),
+    };
+
+    try {
+      const response = await host.completeReflection(request, controller.signal);
+      const record = parseReflectionCandidate(
+        host,
+        request,
+        response,
+        activeReflection,
+      );
+      const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
+      const fenceIsValid =
+        !disposed &&
+        lifecycleRevision === launchRevision &&
+        !controller.signal.aborted &&
+        record !== undefined &&
+        snapshot.sessionId === record.replayEpoch &&
+        (snapshot.ancestry.at(-1) === undefined ||
+          snapshot.ancestry.some(
+            (entry) => entry.id === snapshot.ancestry.at(-1)?.id,
+          )) &&
+        (activeReflections.at(-1)?.id ?? null) ===
+          (activeReflection?.id ?? null) &&
+        prefix.every(
+          (commit, index) => activeCommits[foldedCount + index]?.id === commit.id,
+        );
+      if (fenceIsValid) {
+        host.appendEntry(REFLECTION_CUSTOM_TYPE, record);
+        activeReflections.push(record);
+      }
+    } catch {
+      // Below hard pressure, prior memory and exact source remain authoritative.
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      if (runningController === controller) runningController = undefined;
+      running = false;
+    }
+  }
 
   return {
     restore(snapshot) {
       if (disposed) return;
+      lifecycleRevision += 1;
       ready = undefined;
-      activeCommits = replayObservations(snapshot);
-      passNumber = activeCommits.length;
+      const replayed = replayMemory(snapshot);
+      activeCommits = replayed.commits;
+      activeReflections = replayed.reflections;
+      passNumber = replayed.observationEntryCount;
+      reflectionPassNumber = replayed.reflectionEntryCount;
     },
 
     observe(snapshot, signal) {
       if (disposed || running || ready || signal?.aborted) return;
+      if (
+        snapshot.actor &&
+        reflectionPrefix(
+          host,
+          snapshot.actor,
+          activeCommits,
+          activeReflections.at(-1),
+        )
+      ) {
+        return;
+      }
       const coveredEntryIds = activeCommits.flatMap(
         (commit) => commit.coverage.entryIds,
       );
@@ -592,6 +1068,8 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
       signal?.addEventListener("abort", abort, { once: true });
       passNumber += 1;
       const newestCommit = activeCommits.at(-1);
+      const activeReflection = activeReflections.at(-1);
+      const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
       const expectedParentCommitId = newestCommit?.id ?? null;
       const request: ObservationRequest = {
         passId: `${snapshot.sessionId}:observation:${passNumber}`,
@@ -601,9 +1079,12 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
         ...(newestCommit
           ? {
               activeMemory: {
-                observations: activeCommits.flatMap(
-                  (commit) => commit.observations,
-                ),
+                ...(activeReflection
+                  ? { reflectedHistory: activeReflection.reflectedHistory }
+                  : {}),
+                observations: activeCommits
+                  .slice(foldedCount)
+                  .flatMap((commit) => commit.observations),
                 activeTask: newestCommit.activeTask,
               },
             }
@@ -638,7 +1119,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
         });
     },
 
-    async project(snapshot, messages) {
+    async project(snapshot, messages, signal) {
       if (disposed) return messages;
       if (ready) {
         const coveredCount = activeCommits.reduce(
@@ -664,9 +1145,22 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
         ready = undefined;
       }
 
-      if (activeCommits.length === 0) return messages;
+      await reflectIfRequired(snapshot, signal);
+
+      const activeReflection = activeReflections.at(-1);
+      const projectedCommits =
+        snapshot.actor &&
+        reflectionPrefix(host, snapshot.actor, activeCommits, activeReflection)
+          ? safeProjectionCommits(
+              host,
+              snapshot.actor,
+              activeCommits,
+              activeReflection,
+            )
+          : activeCommits;
+      if (projectedCommits.length === 0) return messages;
       const coveredIds = new Set(
-        activeCommits.flatMap((commit) => commit.coverage.entryIds),
+        projectedCommits.flatMap((commit) => commit.coverage.entryIds),
       );
       const coveredMessages = sourceEntries(snapshot.ancestry)
         .filter((entry) => coveredIds.has(entry.id))
@@ -676,13 +1170,14 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
 
       return [
         ...messages.slice(0, match),
-        renderMemory(activeCommits),
+        renderMemory(projectedCommits, activeReflection),
         ...messages.slice(match + coveredMessages.length),
       ];
     },
 
     dispose() {
       disposed = true;
+      lifecycleRevision += 1;
       ready = undefined;
       runningController?.abort("session memory disposed");
       runningController = undefined;

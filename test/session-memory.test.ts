@@ -101,6 +101,9 @@ describe("SessionMemory", () => {
           soft: 600,
           hard: 850,
           observationOutputBudget: 100,
+          observationTarget: 150,
+          observationHigh: 250,
+          reflectionOutputBudget: 100,
         },
         source: expect.objectContaining({
           entryIds: ["entry-1", "entry-2"],
