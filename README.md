@@ -18,6 +18,35 @@ Observational memory cancels Pi's automatic threshold and overflow compaction. E
 
 Standalone Observer and Reflector usage is attributed through the pinned Pi core capability documented in [`pi-core/README.md`](pi-core/README.md).
 
+## Use and limitations
+
+Build and load the extension with the patched Pi 0.81.1 runtime:
+
+```bash
+npm ci
+npm run acceptance
+PI_BIN=.cache/pi-core-0.81.1/packages/coding-agent/dist/cli.js npm run smoke
+.cache/pi-core-0.81.1/packages/coding-agent/dist/cli.js --extension .
+```
+
+Observational memory is ambient. Pi shows `observing` only while background work is active and a waiting status while hard headroom is being restored. Pressing Escape cancels the actor and current memory work without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
+
+Automatic threshold and overflow compaction are disabled while the extension is loaded. Explicit `/compact` remains a deliberate override and starts a new observational replay epoch. The first version has one built-in policy: there are no settings, memory inspector, memory command, or always-present status. Derived memory remains fallible, exact source remains canonical, and the extension makes no universal cost, latency, or task-quality claim.
+
+## Acceptance evidence
+
+`npm run acceptance` is the repeatable clean-checkout acceptance command. It builds and smoke-loads the extension, builds the pinned patched Pi runtime, runs the deterministic suite and Pi integration/RPC checks, and then runs five paired faux-provider scenarios through Pi's real SDK runtime:
+
+- short/no activation;
+- steady context growth;
+- bursty oversized tool output;
+- one uninterrupted tool loop; and
+- repeated observation/reflection contraction.
+
+Each scenario compares observational memory, exact full-history replay, and stock Pi compaction where applicable. The harness enforces safe actor headroom and valid atomic coverage, writes and evaluates durable tool artifacts, verifies an exact uncovered tail and canonical-source recovery, and reports actor maximum context, observation/reflection usage, hard-wait count and duration, cache reads, repeated work, compactions, and task outcome separately. Focused failure and real-runtime lifecycle smokes cover malformed or delayed work, retry, cancellation, terminal stop, branch navigation, model selection, session replacement, explicit compaction, and chained context extensions.
+
+The auditable JSON report is written to `.cache/acceptance-report.json`. Results apply only to the pinned deterministic configuration and demonstrate bounded-context behavior, not general model quality or economics.
+
 ## Development
 
 Requires Node.js 22.19 or newer and Pi 0.81.1.
@@ -29,6 +58,7 @@ npm test
 npm run build
 npm run smoke
 npm run pi-core:check
+npm run acceptance
 ```
 
 `npm run smoke` builds the package and loads its Pi package manifest in the installed `pi` CLI without making a provider request. Set `PI_BIN` to test a specific Pi executable.
