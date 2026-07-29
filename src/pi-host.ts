@@ -44,7 +44,9 @@ uncertainty, corrections, reversals, unresolved conflicts, and operationally exa
 commands, code, errors, URLs, quantities, versions, and requirements. Do not claim attempted work is
 complete without durable evidence. Treat branch_summary entries only as derived orientation. Retain their
 source provenance (id and fromId) and producer provenance (fromHook). Branch-summary claims are not exact
-source evidence and must not establish completion or action-sensitive details without independent exact evidence.`;
+source evidence and must not establish completion or action-sensitive details without independent exact evidence.
+Treat a toolResult with isError true as terminal failure evidence, never as successful work. Preserve retryable
+provider errors and aborted, truncated, or partial assistant responses with their exact unsuccessful status.`;
 
 const REFLECTOR_PROMPT = `You are the Reflector for observational memory.
 Return only one JSON object, without Markdown fences, in this exact shape:

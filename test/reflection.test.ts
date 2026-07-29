@@ -838,7 +838,7 @@ describe("SessionMemory reflection", () => {
     expect(content).not.toContain("OBSERVATION 2:");
   });
 
-  it("attributes a returned reflection once but cannot activate it after disposal", async () => {
+  it("does not attribute or activate a reflection returned after disposal", async () => {
     const history = observedHistory(3);
     const snapshot = {
       sessionId: "session-1",
@@ -883,7 +883,7 @@ describe("SessionMemory reflection", () => {
     );
     await projection;
 
-    expect(attributeUsage).toHaveBeenCalledOnce();
+    expect(attributeUsage).not.toHaveBeenCalled();
     expect(appendEntry).not.toHaveBeenCalled();
   });
 
@@ -951,7 +951,7 @@ describe("SessionMemory reflection", () => {
     );
     await projection;
 
-    expect(attributeUsage).toHaveBeenCalledOnce();
+    expect(attributeUsage).not.toHaveBeenCalled();
     expect(appendEntry).not.toHaveBeenCalled();
   });
 

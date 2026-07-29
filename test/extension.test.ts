@@ -407,26 +407,105 @@ describe("observational-memory extension", () => {
     expect(childMemory.observe).not.toHaveBeenCalled();
   });
 
-  it("disposes an existing runtime before replacing it", async () => {
+  it("cancels automatic compaction but preserves explicit compaction as a replay boundary", async () => {
     const { pi, handlers } = extensionApi();
-    const first = memorySpies();
+    const memory = memorySpies();
+    const beforeAncestry: SessionEntry[] = [];
+    const compactionEntry: SessionEntry = {
+      type: "compaction",
+      id: "compaction-1",
+      parentId: null,
+      timestamp: "2026-01-01T00:00:01.000Z",
+      summary: "Pi summary",
+      firstKeptEntryId: "kept-entry",
+      tokensBefore: 1_000,
+    };
+    const afterAncestry = [compactionEntry];
+
+    registerObservationalMemory(pi, () => memory);
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      context(beforeAncestry),
+    );
+
+    const thresholdResult = await handlers.get("session_before_compact")?.(
+      { type: "session_before_compact", reason: "threshold" },
+      context(beforeAncestry),
+    );
+    const overflowResult = await handlers.get("session_before_compact")?.(
+      { type: "session_before_compact", reason: "overflow" },
+      context(beforeAncestry),
+    );
+    const manualResult = await handlers.get("session_before_compact")?.(
+      { type: "session_before_compact", reason: "manual" },
+      context(beforeAncestry),
+    );
+    await handlers.get("session_compact")?.(
+      {
+        type: "session_compact",
+        reason: "manual",
+        compactionEntry,
+        fromExtension: false,
+        willRetry: false,
+      },
+      context(afterAncestry),
+    );
+
+    expect(thresholdResult).toEqual({ cancel: true });
+    expect(overflowResult).toEqual({ cancel: true });
+    expect(manualResult).toBeUndefined();
+    expect(memory.restore).toHaveBeenNthCalledWith(1, {
+      sessionId: "session-1",
+      ancestry: beforeAncestry,
+    });
+    expect(memory.restore).toHaveBeenNthCalledWith(2, {
+      sessionId: "session-1",
+      ancestry: beforeAncestry,
+    });
+    expect(memory.restore).toHaveBeenNthCalledWith(3, {
+      sessionId: "session-1",
+      ancestry: afterAncestry,
+    });
+  });
+
+  it("disposes and fences an existing runtime before rebinding its host context", async () => {
+    const { pi, handlers } = extensionApi();
+    const oldSetStatus = vi.fn();
+    const newSetStatus = vi.fn();
+    const oldContext = {
+      ...context([]),
+      ui: { setStatus: oldSetStatus },
+    } as unknown as ExtensionContext;
+    const newContext = {
+      ...context([]),
+      ui: { setStatus: newSetStatus },
+    } as unknown as ExtensionContext;
     const second = memorySpies();
-    const createMemory = vi.fn()
-      .mockReturnValueOnce(first)
-      .mockReturnValueOnce(second);
-    const ctx = context([]);
+    const createMemory = vi.fn((host: SessionMemoryHost) => {
+      if (createMemory.mock.calls.length > 1) return second;
+      return {
+        ...memorySpies(),
+        dispose: vi.fn(() => host.setStatus?.("disposing old runtime")),
+      };
+    });
 
     registerObservationalMemory(pi, createMemory);
     await handlers.get("session_start")?.(
       { type: "session_start", reason: "startup" },
-      ctx,
+      oldContext,
     );
+    const first = createMemory.mock.results[0]?.value;
     await handlers.get("session_start")?.(
       { type: "session_start", reason: "reload" },
-      ctx,
+      newContext,
     );
 
-    expect(first.dispose).toHaveBeenCalledOnce();
+    expect(first?.dispose).toHaveBeenCalledOnce();
+    expect(oldSetStatus).toHaveBeenCalledWith(
+      "observational-memory",
+      "disposing old runtime",
+    );
+    expect(newSetStatus).not.toHaveBeenCalled();
     expect(second.restore).toHaveBeenCalledOnce();
   });
 });

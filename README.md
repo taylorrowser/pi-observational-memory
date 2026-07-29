@@ -12,6 +12,10 @@ The selected root-to-leaf Pi ancestry is the sole replay authority. Successful t
 
 Context hooks compose conservatively. Covered Pi-built source is replaced only when its canonical messages occur as one exact, unambiguous sequence in the incoming chained context. Messages inserted outside that sequence retain their order. Rewritten, missing, duplicated, reordered, or interleaved source is preserved exactly; under hard pressure the actor stops visibly rather than deleting ambiguous or third-party context.
 
+Actor-model changes recompute every pressure and request-headroom budget without invalidating committed memory or changing its producer provenance. Completed passes frozen under an earlier model may still activate when their ancestry and coverage remain valid. Failed, aborted, and partial assistant responses remain exact until a later complete boundary, and terminal tool failures remain explicitly failed evidence.
+
+Observational memory cancels Pi's automatic threshold and overflow compaction. Explicit `/compact` remains available: it cancels pre-compaction memory work and creates a fresh replay epoch where Pi's summary and retained tail become authoritative. Navigating before that compaction entry restores the earlier valid observational epoch. Session replacement and shutdown fence old work before rebinding, and responses returned after that fence append neither memory nor usage to a new session.
+
 Standalone Observer and Reflector usage is attributed through the pinned Pi core capability documented in [`pi-core/README.md`](pi-core/README.md).
 
 ## Development

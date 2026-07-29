@@ -1,4 +1,4 @@
-# Pi core usage-attribution patch
+# Pi core compatibility patch
 
 `extension-usage.patch` is a source patch against:
 
@@ -6,7 +6,7 @@
 - Tag: `v0.81.1`
 - Commit: `20be4b18d4c57487f8993d2762bace129f0cf7c6`
 
-It adds `pi.appendUsage(...)`, a persisted, non-model-visible `extension_usage` session-ledger entry, and aggregates those entries through session/RPC statistics, the footer, usage breakdowns, and HTML exports.
+It adds `pi.appendUsage(...)`, a persisted, non-model-visible `extension_usage` session-ledger entry, and aggregates those entries through session/RPC statistics, the footer, usage breakdowns, and HTML exports. It also preserves an overflow-error response when an extension cancels automatic compaction, removing that response only after successful compact-and-retry recovery.
 
 Run the reproducible verification from this repository:
 
