@@ -2,9 +2,11 @@
 
 A Pi extension for session-scoped observational memory during long user turns.
 
-The extension watches completed model steps and remains inert below a built-in soft pressure watermark. Above it, the extension asynchronously observes the oldest complete source prefix with the current actor model, validates and persists the resulting memory, and activates it on the next safe context projection. The exact uncovered source tail remains unchanged, and committed memory replays after session reload.
+The extension watches completed model steps and remains inert below a built-in soft pressure watermark. Above it, the extension asynchronously observes the oldest complete source prefix with the current actor model, validates and persists the resulting memory, and activates it on the next safe context projection. When active observations reach their high watermark, the projection waits for one validated reflection generation that folds the oldest contiguous observations toward their target. Replay selects only the newest valid reflection, newer observations, the newest active-task anchor, and the exact uncovered source tail.
 
-Standalone Observer usage is attributed through the pinned Pi core capability documented in [`pi-core/README.md`](pi-core/README.md).
+The built-in policy derives every threshold from the actor model's usable input budget: raw target 50%, soft pressure 60%, hard pressure 85%, observation target 15%, and observation high pressure 25%. Observer and Reflector output budgets are capped at 10% of usable input or the model's maximum output, whichever is smaller.
+
+Standalone Observer and Reflector usage is attributed through the pinned Pi core capability documented in [`pi-core/README.md`](pi-core/README.md).
 
 ## Development
 

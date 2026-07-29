@@ -58,7 +58,11 @@ export function registerObservationalMemory(
     currentContext = context;
 
     return {
-      messages: await memory.project(snapshot(context), event.messages),
+      messages: await memory.project(
+        snapshot(context),
+        event.messages,
+        context.signal,
+      ),
     };
   });
 

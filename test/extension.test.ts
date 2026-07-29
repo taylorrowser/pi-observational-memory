@@ -113,6 +113,7 @@ describe("observational-memory extension", () => {
     expect(memory.project).toHaveBeenCalledWith(
       { sessionId: "session-1", ancestry },
       messages,
+      abort.signal,
     );
     expect(contextResult).toEqual({ messages });
     expect(memory.dispose).toHaveBeenCalledOnce();
