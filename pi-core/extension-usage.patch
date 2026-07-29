@@ -51,10 +51,23 @@ index e2c49f1..f0dc1c8 100644
  
  Extension-injected messages that DO participate in LLM context.
 diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
-index 4fdaaaa..15b04fd 100644
+index 4fdaaaa..59e2729 100644
 --- a/packages/coding-agent/src/core/agent-session.ts
 +++ b/packages/coding-agent/src/core/agent-session.ts
-@@ -2383,6 +2383,13 @@ export class AgentSession {
+@@ -1999,12 +1999,6 @@ export class AgentSession {
+ 			}
+ 
+ 			this._overflowRecoveryAttempted = true;
+-			// Remove the error message from agent state (it IS saved to session for history,
+-			// but we don't want it in context for the retry)
+-			const messages = this.agent.state.messages;
+-			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+-				this.agent.state.messages = messages.slice(0, -1);
+-			}
+ 			return await this._runAutoCompaction("overflow", willRetry);
+ 		}
+ 
+@@ -2383,6 +2377,13 @@ export class AgentSession {
  						this._emit({ type: "entry_appended", entry });
  					}
  				},
@@ -68,7 +81,7 @@ index 4fdaaaa..15b04fd 100644
  				setSessionName: (name) => {
  					this.setSessionName(name);
  				},
-@@ -3108,7 +3115,9 @@ export class AgentSession {
+@@ -3108,7 +3109,9 @@ export class AgentSession {
  		const usageTotals = createUsageTotals();
  
  		for (const entry of this.sessionManager.getEntries()) {
@@ -569,6 +582,48 @@ index 310114a..ce967e2 100644
  	it("shows the latest cache hit rate when cache usage is present", () => {
  		const session = createSession({
  			sessionName: "",
+diff --git a/packages/coding-agent/test/suite/agent-session-compaction.test.ts b/packages/coding-agent/test/suite/agent-session-compaction.test.ts
+index 3364913..87e1a49 100644
+--- a/packages/coding-agent/test/suite/agent-session-compaction.test.ts
++++ b/packages/coding-agent/test/suite/agent-session-compaction.test.ts
+@@ -267,6 +267,37 @@ describe("AgentSession compaction characterization", () => {
+ 		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
+ 	});
+ 
++	it("preserves the overflow response when an extension cancels automatic compaction", async () => {
++		const harness = await createHarness({
++			settings: { compaction: { enabled: true, keepRecentTokens: 1 } },
++			extensionFactories: [
++				(pi) => {
++					pi.on("session_before_compact", (event) =>
++						event.reason === "manual" ? undefined : { cancel: true },
++					);
++				},
++			],
++		});
++		harnesses.push(harness);
++		seedCompactableSession(harness);
++		const overflowMessage = createAssistant(harness, {
++			stopReason: "error",
++			errorMessage: "prompt is too long",
++			timestamp: Date.now(),
++		});
++		harness.sessionManager.appendMessage(overflowMessage);
++		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
++		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
++
++		await expect(sessionInternals._checkCompaction(overflowMessage)).resolves.toBe(false);
++
++		expect(harness.session.messages.at(-1)).toMatchObject({
++			role: "assistant",
++			stopReason: "error",
++			errorMessage: "prompt is too long",
++		});
++	});
++
+ 	it("does not retry overflow recovery more than once", async () => {
+ 		const harness = await createHarness();
+ 		harnesses.push(harness);
 diff --git a/packages/coding-agent/test/suite/agent-session-runtime.test.ts b/packages/coding-agent/test/suite/agent-session-runtime.test.ts
 index 79855e9..cad6c0d 100644
 --- a/packages/coding-agent/test/suite/agent-session-runtime.test.ts

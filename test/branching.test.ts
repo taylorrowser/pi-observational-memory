@@ -772,7 +772,9 @@ describe("SessionMemory branch lifecycle", () => {
     const oldRequest = completeObservation.mock.calls[0]?.[0];
     if (!oldRequest) throw new Error("expected old request");
     resolvers[0]?.(validCandidate(oldRequest));
-    await vi.waitFor(() => expect(attributeUsage).toHaveBeenCalledOnce());
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(attributeUsage).not.toHaveBeenCalled();
     memory.observe(ancestorSnapshot);
 
     expect(completeObservation).toHaveBeenCalledTimes(2);

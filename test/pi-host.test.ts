@@ -97,7 +97,7 @@ describe("Pi SessionMemory host", () => {
       model,
       expect.objectContaining({
         systemPrompt: expect.stringMatching(
-          /branch_summary[\s\S]*derived orientation[\s\S]*not exact\s+source evidence[\s\S]*completion or action-sensitive details/,
+          /branch_summary[\s\S]*derived orientation[\s\S]*not exact\s+source evidence[\s\S]*completion or action-sensitive details[\s\S]*toolResult[\s\S]*isError[\s\S]*failure/,
         ),
         messages: [
           expect.objectContaining({

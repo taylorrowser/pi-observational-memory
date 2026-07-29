@@ -72,13 +72,26 @@ export function registerObservationalMemory(
   let memory: SessionMemory | undefined;
 
   pi.on("session_start", (_event, context) => {
-    currentContext = context;
     memory?.dispose();
+    currentContext = context;
     memory = createMemory(host);
     memory.restore(snapshot(context));
   });
 
   pi.on("session_tree", (_event, context) => {
+    if (!memory) return;
+    currentContext = context;
+    memory.restore(snapshot(context));
+  });
+
+  pi.on("session_before_compact", (event, context) => {
+    if (event.reason !== "manual") return { cancel: true };
+    if (!memory) return;
+    currentContext = context;
+    memory.restore(snapshot(context));
+  });
+
+  pi.on("session_compact", (_event, context) => {
     if (!memory) return;
     currentContext = context;
     memory.restore(snapshot(context));

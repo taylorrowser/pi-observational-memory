@@ -1,4 +1,5 @@
 import {
+  buildContextEntries,
   type ContextEvent,
   type SessionEntry,
   sessionEntryToContextMessages,
@@ -258,9 +259,29 @@ function isReflectionEntry(
 }
 
 function sourceEntries(ancestry: readonly SessionEntry[]): SessionEntry[] {
-  return ancestry.filter(
+  return buildContextEntries([...ancestry]).filter(
     (entry) => !isObservationEntry(entry) && !isReflectionEntry(entry),
   );
+}
+
+interface CompactionBoundary {
+  readonly entry: Extract<SessionEntry, { type: "compaction" }>;
+  readonly index: number;
+}
+
+function latestCompaction(
+  ancestry: readonly SessionEntry[],
+): CompactionBoundary | undefined {
+  let latest: CompactionBoundary | undefined;
+  for (const [index, entry] of ancestry.entries()) {
+    if (entry.type === "compaction") latest = { entry, index };
+  }
+  return latest;
+}
+
+function replayEpoch(snapshot: SessionSnapshot): string {
+  const compaction = latestCompaction(snapshot.ancestry)?.entry;
+  return compaction ? `${snapshot.sessionId}:${compaction.id}` : snapshot.sessionId;
 }
 
 function derivedOrientations(
@@ -897,14 +918,28 @@ interface ReplayedMemory {
 }
 
 function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
-  const seenSource: SessionEntry[] = [];
   const commits: ObservationCommit[] = [];
   const reflections: ReflectionGeneration[] = [];
   let coveredCount = 0;
   let observationEntryCount = 0;
   let reflectionEntryCount = 0;
+  const compactionIndex = latestCompaction(snapshot.ancestry)?.index ?? -1;
+  const postCompactionIds = new Set(
+    snapshot.ancestry.slice(compactionIndex + 1).map((entry) => entry.id),
+  );
+  const seenSource =
+    compactionIndex < 0
+      ? []
+      : sourceEntries(snapshot.ancestry).filter(
+          (entry) => !postCompactionIds.has(entry.id),
+        );
 
-  for (const [index, entry] of snapshot.ancestry.entries()) {
+  for (
+    let index = compactionIndex + 1;
+    index < snapshot.ancestry.length;
+    index += 1
+  ) {
+    const entry = snapshot.ancestry[index]!;
     const expectedPhysicalParentId = snapshot.ancestry[index - 1]?.id ?? null;
     const isPhysicallyContiguous = entry.parentId === expectedPhysicalParentId;
     if (isObservationEntry(entry)) {
@@ -1093,7 +1128,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
       expectedParentCommitId,
       launchRevision: lifecycleRevision,
       request: {
-        passId: `${snapshot.sessionId}:observation:${passNumber}`,
+        passId: `${replayEpoch(snapshot)}:observation:${passNumber}`,
         parentCommitId: expectedParentCommitId,
         actor: snapshot.actor,
         pressure: pressurePolicy(snapshot.actor),
@@ -1141,6 +1176,13 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           frozen.request,
           controller.signal,
         );
+        if (
+          disposed ||
+          controller.signal.aborted ||
+          lifecycleRevision !== frozen.launchRevision
+        ) {
+          return "cancelled";
+        }
         const record = parseCandidate(
           host,
           frozen.request,
@@ -1338,7 +1380,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
     const launchRevision = lifecycleRevision;
     const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
     const request: ReflectionRequest = {
-      passId: `${snapshot.sessionId}:reflection:${reflectionPassNumber}`,
+      passId: `${replayEpoch(snapshot)}:reflection:${reflectionPassNumber}`,
       actor: snapshot.actor,
       pressure: pressurePolicy(snapshot.actor),
       parentReflection: activeReflection
@@ -1371,6 +1413,13 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           request,
           controller.signal,
         );
+        if (
+          disposed ||
+          controller.signal.aborted ||
+          lifecycleRevision !== launchRevision
+        ) {
+          return "cancelled";
+        }
         const record = parseReflectionCandidate(
           host,
           request,
@@ -1378,11 +1427,8 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           activeReflection,
         );
         const fenceIsValid =
-          !disposed &&
-          lifecycleRevision === launchRevision &&
-          !controller.signal.aborted &&
           record !== undefined &&
-          snapshot.sessionId === record.replayEpoch &&
+          replayEpoch(snapshot) === record.replayEpoch &&
           (activeReflections.at(-1)?.id ?? null) ===
             (activeReflection?.id ?? null) &&
           prefix.every(
