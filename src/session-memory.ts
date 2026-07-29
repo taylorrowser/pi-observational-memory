@@ -1179,8 +1179,40 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
     return promise;
   }
 
-  function activateReady(snapshot: SessionSnapshot): void {
-    if (!ready) return;
+  function coveredBaselineMessages(
+    snapshot: SessionSnapshot,
+    commits: readonly ObservationCommit[],
+  ): ContextEvent["messages"] | undefined {
+    const baselineEntries = sourceEntries(snapshot.ancestry);
+    const coveredIds = commits.flatMap((commit) => commit.coverage.entryIds);
+    if (
+      !coveredIds.every(
+        (entryId, index) => baselineEntries[index]?.id === entryId,
+      )
+    ) {
+      return undefined;
+    }
+    return baselineEntries.slice(0, coveredIds.length).flatMap(entryMessages);
+  }
+
+  function canCompose(
+    snapshot: SessionSnapshot,
+    messages: ContextEvent["messages"],
+    commits: readonly ObservationCommit[],
+  ): boolean {
+    if (commits.length === 0) return true;
+    const coveredMessages = coveredBaselineMessages(snapshot, commits);
+    return (
+      coveredMessages !== undefined &&
+      findUniqueSequence(messages, coveredMessages) !== undefined
+    );
+  }
+
+  function activateReady(
+    snapshot: SessionSnapshot,
+    messages: ContextEvent["messages"],
+  ): "none" | "activated" | "ambiguous" {
+    if (!ready) return "none";
     const coveredCount = activeCommits.reduce(
       (count, commit) => count + commit.coverage.entryIds.length,
       0,
@@ -1198,17 +1230,27 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           sourceEntries(snapshot.ancestry)[coveredCount + index]?.id ===
           entryId,
       );
-    if (fenceIsValid) {
-      host.appendEntry(OBSERVATION_CUSTOM_TYPE, candidate.record);
-      activeCommits.push(candidate.record);
+    if (!fenceIsValid) {
+      ready = undefined;
+      return "none";
     }
+
+    const candidateCommits = [...activeCommits, candidate.record];
+    if (!canCompose(snapshot, messages, candidateCommits)) return "ambiguous";
+
+    host.appendEntry(OBSERVATION_CUSTOM_TYPE, candidate.record);
+    activeCommits.push(candidate.record);
     ready = undefined;
+    return "activated";
   }
 
   function projection(
     snapshot: SessionSnapshot,
     messages: ContextEvent["messages"],
-  ): ContextEvent["messages"] {
+  ): {
+    readonly messages: ContextEvent["messages"];
+    readonly ambiguous: boolean;
+  } {
     const activeReflection = activeReflections.at(-1);
     const projectedCommits =
       snapshot.actor &&
@@ -1220,21 +1262,40 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
             activeReflection,
           )
         : activeCommits;
-    if (projectedCommits.length === 0) return messages;
-    const coveredIds = new Set(
-      projectedCommits.flatMap((commit) => commit.coverage.entryIds),
-    );
-    const coveredMessages = sourceEntries(snapshot.ancestry)
-      .filter((entry) => coveredIds.has(entry.id))
-      .flatMap(entryMessages);
+    if (projectedCommits.length === 0) {
+      return { messages, ambiguous: false };
+    }
+    const coveredMessages = coveredBaselineMessages(snapshot, projectedCommits);
+    if (!coveredMessages) return { messages, ambiguous: true };
     const match = findUniqueSequence(messages, coveredMessages);
-    if (match === undefined) return messages;
+    if (match === undefined) return { messages, ambiguous: true };
 
-    return [
-      ...messages.slice(0, match),
-      renderMemory(projectedCommits, activeReflection),
-      ...messages.slice(match + coveredMessages.length),
-    ];
+    return {
+      messages: [
+        ...messages.slice(0, match),
+        renderMemory(projectedCommits, activeReflection),
+        ...messages.slice(match + coveredMessages.length),
+      ],
+      ambiguous: false,
+    };
+  }
+
+  function isIncomingHardUnsafe(
+    snapshot: SessionSnapshot,
+    messages: ContextEvent["messages"],
+  ): boolean {
+    if (!snapshot.actor) return false;
+    const policy = pressurePolicy(snapshot.actor);
+    const incomingTokens = host.estimateTokens(messages);
+    const rawTokens = Math.max(incomingTokens, snapshot.inputTokens ?? 0);
+    return (
+      rawTokens >= policy.hard ||
+      (snapshot.fixedInputTokens ?? 0) +
+        incomingTokens +
+        snapshot.actor.maxTokens +
+        policy.safetyReserve >=
+        snapshot.actor.contextWindow
+    );
   }
 
   function isHardUnsafe(
@@ -1396,10 +1457,23 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
       const projectRevision = lifecycleRevision;
 
       while (!disposed && lifecycleRevision === projectRevision) {
+        let activation: "none" | "activated" | "ambiguous" = "none";
         if (signal?.aborted) ready = undefined;
-        else activateReady(snapshot);
-        let projected = projection(snapshot, messages);
-        let hardUnsafe = isHardUnsafe(snapshot, projected);
+        else activation = activateReady(snapshot, messages);
+        if (
+          activation === "ambiguous" ||
+          !canCompose(snapshot, messages, activeCommits)
+        ) {
+          if (isIncomingHardUnsafe(snapshot, messages)) stopActor("exhausted");
+          return messages;
+        }
+        const composition = projection(snapshot, messages);
+        const projected = composition.messages;
+        if (composition.ambiguous) {
+          if (isIncomingHardUnsafe(snapshot, messages)) stopActor("exhausted");
+          return messages;
+        }
+        const hardUnsafe = isHardUnsafe(snapshot, projected);
         const reflectionRequired =
           snapshot.actor &&
           reflectionPrefix(
@@ -1420,8 +1494,6 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           return projected;
         }
 
-        projected = projection(snapshot, messages);
-        hardUnsafe = isHardUnsafe(snapshot, projected);
         if (!hardUnsafe) {
           if (status === "waiting for memory") setStatus(undefined);
           return projected;
