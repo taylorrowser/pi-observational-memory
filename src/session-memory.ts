@@ -16,6 +16,8 @@ export interface SessionSnapshot {
   readonly ancestry: readonly SessionEntry[];
   readonly actor?: ActorModel;
   readonly inputTokens?: number;
+  /** Estimated system-prompt and active-tool tokens for the next actor request. */
+  readonly fixedInputTokens?: number;
 }
 
 export interface SessionMemory {
@@ -51,6 +53,7 @@ export interface ObservationRequest {
     readonly rawTarget: number;
     readonly soft: number;
     readonly hard: number;
+    readonly safetyReserve: number;
     readonly observationOutputBudget: number;
     readonly observationTarget: number;
     readonly observationHigh: number;
@@ -197,6 +200,8 @@ export interface SessionMemoryHost {
     request: ReflectionRequest,
     signal?: AbortSignal,
   ): Promise<ReflectionResponse>;
+  setStatus?(status: string | undefined): void;
+  abortActor?(message?: string): void;
 }
 
 const RAW_TARGET_RATIO = 0.5;
@@ -215,6 +220,8 @@ function pressurePolicy(actor: ActorModel): ObservationRequest["pressure"] {
     rawTarget: Math.floor(usableInput * RAW_TARGET_RATIO),
     soft: Math.floor(usableInput * SOFT_PRESSURE_RATIO),
     hard: Math.floor(usableInput * HARD_PRESSURE_RATIO),
+    safetyReserve:
+      usableInput - Math.floor(usableInput * HARD_PRESSURE_RATIO),
     observationOutputBudget: Math.min(
       actor.maxTokens,
       Math.max(1, Math.floor(usableInput * OBSERVATION_OUTPUT_RATIO)),
@@ -318,13 +325,11 @@ function completedStepBoundaries(entries: readonly SessionEntry[]): number[] {
   return boundaries;
 }
 
-function frozenPrefix(
+function uncoveredRawTokens(
   host: SessionMemoryHost,
   snapshot: SessionSnapshot,
   coveredEntryIds: readonly string[],
-): SessionEntry[] | undefined {
-  if (!snapshot.actor) return undefined;
-  const policy = pressurePolicy(snapshot.actor);
+): number | undefined {
   const allSourceEntries = sourceEntries(snapshot.ancestry);
   if (
     !coveredEntryIds.every(
@@ -333,10 +338,40 @@ function frozenPrefix(
   ) {
     return undefined;
   }
-  const inputTokens =
-    snapshot.inputTokens ??
-    host.estimateTokens(allSourceEntries.flatMap(entryMessages));
-  if (inputTokens < policy.soft) return undefined;
+  const coveredMessages = allSourceEntries
+    .slice(0, coveredEntryIds.length)
+    .flatMap(entryMessages);
+  const uncoveredMessages = allSourceEntries
+    .slice(coveredEntryIds.length)
+    .flatMap(entryMessages);
+  const estimatedUncovered =
+    uncoveredMessages.length === 0 ? 0 : host.estimateTokens(uncoveredMessages);
+  if (snapshot.inputTokens === undefined) return estimatedUncovered;
+  const estimatedCovered =
+    coveredMessages.length === 0 ? 0 : host.estimateTokens(coveredMessages);
+  return Math.max(
+    estimatedUncovered,
+    Math.max(0, snapshot.inputTokens - estimatedCovered),
+  );
+}
+
+function frozenPrefix(
+  host: SessionMemoryHost,
+  snapshot: SessionSnapshot,
+  coveredEntryIds: readonly string[],
+  force = false,
+): SessionEntry[] | undefined {
+  if (!snapshot.actor) return undefined;
+  const policy = pressurePolicy(snapshot.actor);
+  const allSourceEntries = sourceEntries(snapshot.ancestry);
+  const uncoveredTokens = uncoveredRawTokens(host, snapshot, coveredEntryIds);
+  const inputTokens = force
+    ? uncoveredTokens
+    : (snapshot.inputTokens ??
+      host.estimateTokens(allSourceEntries.flatMap(entryMessages)));
+  if (inputTokens === undefined || (!force && inputTokens < policy.soft)) {
+    return undefined;
+  }
 
   const tokensToRetire = Math.max(1, inputTokens - policy.rawTarget);
   const entries = allSourceEntries.slice(coveredEntryIds.length);
@@ -990,145 +1025,74 @@ function renderMemory(
 }
 
 export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
+  type PassOutcome = "ready" | "failed" | "cancelled";
+  interface FrozenObservation {
+    readonly request: ObservationRequest;
+    readonly sessionId: string;
+    readonly launchLeafId: string | null;
+    readonly expectedParentCommitId: string | null;
+    readonly launchRevision: number;
+  }
+
   let disposed = false;
   let running = false;
   let runningController: AbortController | undefined;
+  let runningPromise: Promise<PassOutcome> | undefined;
+  let runningObservation: FrozenObservation | undefined;
   let passNumber = 0;
   let reflectionPassNumber = 0;
   let ready: ReadyObservation | undefined;
   let activeCommits: ObservationCommit[] = [];
   let activeReflections: ReflectionGeneration[] = [];
   let lifecycleRevision = 0;
+  let status: string | undefined;
+  let terminal = false;
 
-  async function reflectIfRequired(
-    snapshot: SessionSnapshot,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    const activeReflection = activeReflections.at(-1);
-    const prefix = snapshot.actor
-      ? reflectionPrefix(host, snapshot.actor, activeCommits, activeReflection)
-      : undefined;
-    if (
-      !prefix ||
-      !snapshot.actor ||
-      !host.completeReflection ||
-      running ||
-      signal?.aborted
-    ) {
-      return;
-    }
-
-    running = true;
-    const launchRevision = lifecycleRevision;
-    const controller = new AbortController();
-    runningController = controller;
-    const abort = () => controller.abort(signal?.reason);
-    signal?.addEventListener("abort", abort, { once: true });
-    reflectionPassNumber += 1;
-    const request: ReflectionRequest = {
-      passId: `${snapshot.sessionId}:reflection:${reflectionPassNumber}`,
-      actor: snapshot.actor,
-      pressure: pressurePolicy(snapshot.actor),
-      parentReflection: activeReflection
-        ? {
-            id: activeReflection.id,
-            reflectedHistory: activeReflection.reflectedHistory,
-            foldedObservationIds: activeReflection.foldedObservationIds,
-          }
-        : null,
-      coverage: { observationIds: prefix.map((commit) => commit.id) },
-      observations: prefix.map((commit) => ({
-        id: commit.id,
-        timestamp: commit.timestamp,
-        observations: commit.observations,
-        derivedOrientations: commit.derivedOrientations,
-      })),
-    };
-
-    try {
-      const response = await host.completeReflection(request, controller.signal);
-      const record = parseReflectionCandidate(
-        host,
-        request,
-        response,
-        activeReflection,
-      );
-      const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
-      const fenceIsValid =
-        !disposed &&
-        lifecycleRevision === launchRevision &&
-        !controller.signal.aborted &&
-        record !== undefined &&
-        snapshot.sessionId === record.replayEpoch &&
-        (snapshot.ancestry.at(-1) === undefined ||
-          snapshot.ancestry.some(
-            (entry) => entry.id === snapshot.ancestry.at(-1)?.id,
-          )) &&
-        (activeReflections.at(-1)?.id ?? null) ===
-          (activeReflection?.id ?? null) &&
-        prefix.every(
-          (commit, index) => activeCommits[foldedCount + index]?.id === commit.id,
-        );
-      if (fenceIsValid) {
-        host.appendEntry(REFLECTION_CUSTOM_TYPE, record);
-        activeReflections.push(record);
-      }
-    } catch {
-      // Below hard pressure, prior memory and exact source remain authoritative.
-    } finally {
-      signal?.removeEventListener("abort", abort);
-      if (runningController === controller) {
-        runningController = undefined;
-        running = false;
-      }
-    }
+  function setStatus(next: string | undefined): void {
+    if (status === next) return;
+    status = next;
+    host.setStatus?.(next);
   }
 
-  return {
-    restore(snapshot) {
-      if (disposed) return;
-      lifecycleRevision += 1;
-      ready = undefined;
-      runningController?.abort("session ancestry restored");
-      runningController = undefined;
-      running = false;
-      const replayed = replayMemory(snapshot);
-      activeCommits = replayed.commits;
-      activeReflections = replayed.reflections;
-      passNumber = replayed.observationEntryCount;
-      reflectionPassNumber = replayed.reflectionEntryCount;
-    },
+  function stopActor(kind: "cancelled" | "exhausted"): void {
+    if (terminal) return;
+    terminal = true;
+    const cancelled = kind === "cancelled";
+    setStatus(
+      cancelled
+        ? "memory cancelled — source preserved"
+        : "memory stopped — source preserved",
+    );
+    host.abortActor?.(
+      cancelled
+        ? "Observational memory was cancelled; exact source was preserved."
+        : "Observational memory could not restore safe headroom; exact source was preserved.",
+    );
+  }
 
-    observe(snapshot, signal) {
-      if (disposed || running || ready || signal?.aborted) return;
-      if (
-        snapshot.actor &&
-        reflectionPrefix(
-          host,
-          snapshot.actor,
-          activeCommits,
-          activeReflections.at(-1),
-        )
-      ) {
-        return;
-      }
-      const coveredEntryIds = activeCommits.flatMap(
-        (commit) => commit.coverage.entryIds,
-      );
-      const prefix = frozenPrefix(host, snapshot, coveredEntryIds);
-      if (!prefix || !snapshot.actor) return;
+  function coveredEntryIds(): string[] {
+    return activeCommits.flatMap((commit) => commit.coverage.entryIds);
+  }
 
-      running = true;
-      const controller = new AbortController();
-      runningController = controller;
-      const abort = () => controller.abort(signal?.reason);
-      signal?.addEventListener("abort", abort, { once: true });
-      passNumber += 1;
-      const newestCommit = activeCommits.at(-1);
-      const activeReflection = activeReflections.at(-1);
-      const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
-      const expectedParentCommitId = newestCommit?.id ?? null;
-      const request: ObservationRequest = {
+  function freezeObservation(
+    snapshot: SessionSnapshot,
+    force: boolean,
+  ): FrozenObservation | undefined {
+    if (!snapshot.actor) return undefined;
+    const prefix = frozenPrefix(host, snapshot, coveredEntryIds(), force);
+    if (!prefix) return undefined;
+
+    passNumber += 1;
+    const newestCommit = activeCommits.at(-1);
+    const activeReflection = activeReflections.at(-1);
+    const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
+    const expectedParentCommitId = newestCommit?.id ?? null;
+    return {
+      sessionId: snapshot.sessionId,
+      launchLeafId: snapshot.ancestry.at(-1)?.id ?? null,
+      expectedParentCommitId,
+      launchRevision: lifecycleRevision,
+      request: {
         passId: `${snapshot.sessionId}:observation:${passNumber}`,
         parentCommitId: expectedParentCommitId,
         actor: snapshot.actor,
@@ -1153,88 +1117,367 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           entryIds: prefix.map((entry) => entry.id),
           entries: prefix,
         },
-      };
-      void host
-        .completeObservation(request, controller.signal)
-        .then((response) => {
-          const record = parseCandidate(
+      },
+    };
+  }
+
+  function executeObservation(
+    frozen: FrozenObservation,
+    signal: AbortSignal | undefined,
+    hardPaused: boolean,
+  ): Promise<PassOutcome> {
+    running = true;
+    runningObservation = frozen;
+    if (!hardPaused) setStatus("observing");
+    const controller = new AbortController();
+    runningController = controller;
+    const abort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) controller.abort(signal.reason);
+
+    const promise = (async (): Promise<PassOutcome> => {
+      try {
+        const response = await host.completeObservation(
+          frozen.request,
+          controller.signal,
+        );
+        const record = parseCandidate(
+          host,
+          frozen.request,
+          response,
+          frozen.expectedParentCommitId,
+        );
+        if (
+          disposed ||
+          controller.signal.aborted ||
+          lifecycleRevision !== frozen.launchRevision
+        ) {
+          return "cancelled";
+        }
+        if (!record) return "failed";
+        ready = {
+          sessionId: frozen.sessionId,
+          launchLeafId: frozen.launchLeafId,
+          expectedParentCommitId: frozen.expectedParentCommitId,
+          record,
+        };
+        return "ready";
+      } catch {
+        return controller.signal.aborted ? "cancelled" : "failed";
+      } finally {
+        signal?.removeEventListener("abort", abort);
+        if (runningController === controller) {
+          runningController = undefined;
+          running = false;
+          runningPromise = undefined;
+          runningObservation = undefined;
+          if (status === "observing") setStatus(undefined);
+        }
+      }
+    })();
+    runningPromise = promise;
+    return promise;
+  }
+
+  function activateReady(snapshot: SessionSnapshot): void {
+    if (!ready) return;
+    const coveredCount = activeCommits.reduce(
+      (count, commit) => count + commit.coverage.entryIds.length,
+      0,
+    );
+    const candidate = ready;
+    const fenceIsValid =
+      candidate.sessionId === snapshot.sessionId &&
+      (candidate.launchLeafId === null ||
+        snapshot.ancestry.some(
+          (entry) => entry.id === candidate.launchLeafId,
+        )) &&
+      candidate.expectedParentCommitId === (activeCommits.at(-1)?.id ?? null) &&
+      candidate.record.coverage.entryIds.every(
+        (entryId, index) =>
+          sourceEntries(snapshot.ancestry)[coveredCount + index]?.id ===
+          entryId,
+      );
+    if (fenceIsValid) {
+      host.appendEntry(OBSERVATION_CUSTOM_TYPE, candidate.record);
+      activeCommits.push(candidate.record);
+    }
+    ready = undefined;
+  }
+
+  function projection(
+    snapshot: SessionSnapshot,
+    messages: ContextEvent["messages"],
+  ): ContextEvent["messages"] {
+    const activeReflection = activeReflections.at(-1);
+    const projectedCommits =
+      snapshot.actor &&
+      reflectionPrefix(host, snapshot.actor, activeCommits, activeReflection)
+        ? safeProjectionCommits(
             host,
-            request,
-            response,
-            expectedParentCommitId,
-          );
-          if (disposed || controller.signal.aborted || !record) return;
-          ready = {
-            sessionId: snapshot.sessionId,
-            launchLeafId: snapshot.ancestry.at(-1)?.id ?? null,
-            expectedParentCommitId,
-            record,
-          };
-        })
-        .catch(() => {})
-        .finally(() => {
-          signal?.removeEventListener("abort", abort);
-          if (runningController === controller) {
-            runningController = undefined;
-            running = false;
+            snapshot.actor,
+            activeCommits,
+            activeReflection,
+          )
+        : activeCommits;
+    if (projectedCommits.length === 0) return messages;
+    const coveredIds = new Set(
+      projectedCommits.flatMap((commit) => commit.coverage.entryIds),
+    );
+    const coveredMessages = sourceEntries(snapshot.ancestry)
+      .filter((entry) => coveredIds.has(entry.id))
+      .flatMap(entryMessages);
+    const match = findUniqueSequence(messages, coveredMessages);
+    if (match === undefined) return messages;
+
+    return [
+      ...messages.slice(0, match),
+      renderMemory(projectedCommits, activeReflection),
+      ...messages.slice(match + coveredMessages.length),
+    ];
+  }
+
+  function isHardUnsafe(
+    snapshot: SessionSnapshot,
+    projectedMessages: ContextEvent["messages"],
+  ): boolean {
+    if (!snapshot.actor) return false;
+    const policy = pressurePolicy(snapshot.actor);
+    const rawTokens = uncoveredRawTokens(host, snapshot, coveredEntryIds());
+    if (rawTokens === undefined || rawTokens >= policy.hard) return true;
+
+    const projectedInput =
+      (snapshot.fixedInputTokens ?? 0) + host.estimateTokens(projectedMessages);
+    return (
+      projectedInput + snapshot.actor.maxTokens + policy.safetyReserve >=
+      snapshot.actor.contextWindow
+    );
+  }
+
+  async function reflect(
+    snapshot: SessionSnapshot,
+    signal: AbortSignal | undefined,
+    hardPaused: boolean,
+  ): Promise<"accepted" | "failed" | "cancelled"> {
+    const activeReflection = activeReflections.at(-1);
+    const prefix = snapshot.actor
+      ? reflectionPrefix(host, snapshot.actor, activeCommits, activeReflection)
+      : undefined;
+    if (
+      !prefix ||
+      !snapshot.actor ||
+      !host.completeReflection ||
+      running ||
+      signal?.aborted
+    ) {
+      return signal?.aborted ? "cancelled" : "failed";
+    }
+
+    reflectionPassNumber += 1;
+    const launchRevision = lifecycleRevision;
+    const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
+    const request: ReflectionRequest = {
+      passId: `${snapshot.sessionId}:reflection:${reflectionPassNumber}`,
+      actor: snapshot.actor,
+      pressure: pressurePolicy(snapshot.actor),
+      parentReflection: activeReflection
+        ? {
+            id: activeReflection.id,
+            reflectedHistory: activeReflection.reflectedHistory,
+            foldedObservationIds: activeReflection.foldedObservationIds,
           }
-        });
+        : null,
+      coverage: { observationIds: prefix.map((commit) => commit.id) },
+      observations: prefix.map((commit) => ({
+        id: commit.id,
+        timestamp: commit.timestamp,
+        observations: commit.observations,
+        derivedOrientations: commit.derivedOrientations,
+      })),
+    };
+    const attempts = hardPaused ? 2 : 1;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      running = true;
+      if (!hardPaused) setStatus("observing");
+      const controller = new AbortController();
+      runningController = controller;
+      const abort = () => controller.abort(signal?.reason);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) controller.abort(signal.reason);
+      try {
+        const response = await host.completeReflection(
+          request,
+          controller.signal,
+        );
+        const record = parseReflectionCandidate(
+          host,
+          request,
+          response,
+          activeReflection,
+        );
+        const fenceIsValid =
+          !disposed &&
+          lifecycleRevision === launchRevision &&
+          !controller.signal.aborted &&
+          record !== undefined &&
+          snapshot.sessionId === record.replayEpoch &&
+          (activeReflections.at(-1)?.id ?? null) ===
+            (activeReflection?.id ?? null) &&
+          prefix.every(
+            (commit, index) =>
+              activeCommits[foldedCount + index]?.id === commit.id,
+          );
+        if (fenceIsValid) {
+          host.appendEntry(REFLECTION_CUSTOM_TYPE, record);
+          activeReflections.push(record);
+          return "accepted";
+        }
+        if (controller.signal.aborted || lifecycleRevision !== launchRevision) {
+          return "cancelled";
+        }
+      } catch {
+        if (controller.signal.aborted) return "cancelled";
+      } finally {
+        signal?.removeEventListener("abort", abort);
+        if (runningController === controller) {
+          runningController = undefined;
+          running = false;
+          if (status === "observing") setStatus(undefined);
+        }
+      }
+    }
+    return "failed";
+  }
+
+  return {
+    restore(snapshot) {
+      if (disposed) return;
+      lifecycleRevision += 1;
+      ready = undefined;
+      terminal = false;
+      runningController?.abort("session ancestry restored");
+      runningController = undefined;
+      runningPromise = undefined;
+      runningObservation = undefined;
+      running = false;
+      setStatus(undefined);
+      const replayed = replayMemory(snapshot);
+      activeCommits = replayed.commits;
+      activeReflections = replayed.reflections;
+      passNumber = replayed.observationEntryCount;
+      reflectionPassNumber = replayed.reflectionEntryCount;
+    },
+
+    observe(snapshot, signal) {
+      if (disposed || terminal || running || ready || signal?.aborted) return;
+      if (
+        snapshot.actor &&
+        reflectionPrefix(
+          host,
+          snapshot.actor,
+          activeCommits,
+          activeReflections.at(-1),
+        )
+      ) {
+        return;
+      }
+      const frozen = freezeObservation(snapshot, false);
+      if (!frozen) return;
+      void executeObservation(frozen, signal, false);
     },
 
     async project(snapshot, messages, signal) {
       if (disposed) return messages;
-      if (ready) {
-        const coveredCount = activeCommits.reduce(
-          (count, commit) => count + commit.coverage.entryIds.length,
-          0,
-        );
-        const fenceIsValid =
-          ready.sessionId === snapshot.sessionId &&
-          (ready.launchLeafId === null ||
-            snapshot.ancestry.some(
-              (entry) => entry.id === ready?.launchLeafId,
-            )) &&
-          ready.expectedParentCommitId === (activeCommits.at(-1)?.id ?? null) &&
-          ready.record.coverage.entryIds.every(
-            (entryId, index) =>
-              sourceEntries(snapshot.ancestry)[coveredCount + index]?.id ===
-              entryId,
-          );
-        if (fenceIsValid) {
-          host.appendEntry(OBSERVATION_CUSTOM_TYPE, ready.record);
-          activeCommits.push(ready.record);
-        }
-        ready = undefined;
+      if (terminal) {
+        host.abortActor?.();
+        return messages;
       }
+      const projectRevision = lifecycleRevision;
 
-      await reflectIfRequired(snapshot, signal);
+      while (!disposed && lifecycleRevision === projectRevision) {
+        if (signal?.aborted) ready = undefined;
+        else activateReady(snapshot);
+        let projected = projection(snapshot, messages);
+        let hardUnsafe = isHardUnsafe(snapshot, projected);
+        const reflectionRequired =
+          snapshot.actor &&
+          reflectionPrefix(
+            host,
+            snapshot.actor,
+            activeCommits,
+            activeReflections.at(-1),
+          );
 
-      const activeReflection = activeReflections.at(-1);
-      const projectedCommits =
-        snapshot.actor &&
-        reflectionPrefix(host, snapshot.actor, activeCommits, activeReflection)
-          ? safeProjectionCommits(
-              host,
-              snapshot.actor,
-              activeCommits,
-              activeReflection,
-            )
-          : activeCommits;
-      if (projectedCommits.length === 0) return messages;
-      const coveredIds = new Set(
-        projectedCommits.flatMap((commit) => commit.coverage.entryIds),
-      );
-      const coveredMessages = sourceEntries(snapshot.ancestry)
-        .filter((entry) => coveredIds.has(entry.id))
-        .flatMap(entryMessages);
-      const match = findUniqueSequence(messages, coveredMessages);
-      if (match === undefined) return messages;
+        if (reflectionRequired) {
+          if (hardUnsafe) setStatus("waiting for memory");
+          const outcome = await reflect(snapshot, signal, hardUnsafe);
+          if (disposed || lifecycleRevision !== projectRevision) return messages;
+          if (outcome === "accepted") continue;
+          if (hardUnsafe) {
+            stopActor(outcome === "cancelled" ? "cancelled" : "exhausted");
+          }
+          return projected;
+        }
 
-      return [
-        ...messages.slice(0, match),
-        renderMemory(projectedCommits, activeReflection),
-        ...messages.slice(match + coveredMessages.length),
-      ];
+        projected = projection(snapshot, messages);
+        hardUnsafe = isHardUnsafe(snapshot, projected);
+        if (!hardUnsafe) {
+          if (status === "waiting for memory") setStatus(undefined);
+          return projected;
+        }
+
+        setStatus("waiting for memory");
+        if (signal?.aborted) {
+          runningController?.abort(signal.reason);
+          stopActor("cancelled");
+          return messages;
+        }
+
+        const inFlight = runningPromise;
+        const inFlightFrozen = runningObservation;
+        if (inFlight && inFlightFrozen) {
+          const abortInFlight = () => runningController?.abort(signal?.reason);
+          signal?.addEventListener("abort", abortInFlight, { once: true });
+          if (signal?.aborted) abortInFlight();
+          const firstOutcome = await inFlight;
+          signal?.removeEventListener("abort", abortInFlight);
+          if (disposed || lifecycleRevision !== projectRevision) return messages;
+          if (firstOutcome === "ready") continue;
+          if (firstOutcome === "cancelled") {
+            stopActor("cancelled");
+            return messages;
+          }
+          const retryOutcome = await executeObservation(
+            inFlightFrozen,
+            signal,
+            true,
+          );
+          if (disposed || lifecycleRevision !== projectRevision) return messages;
+          if (retryOutcome === "ready") continue;
+          stopActor(retryOutcome === "cancelled" ? "cancelled" : "exhausted");
+          return messages;
+        }
+
+        const frozen = freezeObservation(snapshot, true);
+        if (!frozen) {
+          stopActor(signal?.aborted ? "cancelled" : "exhausted");
+          return messages;
+        }
+        const firstOutcome = await executeObservation(frozen, signal, true);
+        if (disposed || lifecycleRevision !== projectRevision) return messages;
+        if (firstOutcome === "ready") continue;
+        if (firstOutcome === "cancelled") {
+          stopActor("cancelled");
+          return messages;
+        }
+        const retryOutcome = await executeObservation(frozen, signal, true);
+        if (disposed || lifecycleRevision !== projectRevision) return messages;
+        if (retryOutcome === "ready") continue;
+        stopActor(retryOutcome === "cancelled" ? "cancelled" : "exhausted");
+        return messages;
+      }
+      return messages;
     },
 
     dispose() {
@@ -1243,6 +1486,10 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
       ready = undefined;
       runningController?.abort("session memory disposed");
       runningController = undefined;
+      runningPromise = undefined;
+      runningObservation = undefined;
+      running = false;
+      setStatus(undefined);
     },
   };
 }

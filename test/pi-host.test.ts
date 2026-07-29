@@ -79,6 +79,7 @@ describe("Pi SessionMemory host", () => {
         rawTarget: 95_904,
         soft: 115_084,
         hard: 163_036,
+        safetyReserve: 28_772,
         observationOutputBudget: 8_192,
         observationTarget: 28_771,
         observationHigh: 47_952,
@@ -187,6 +188,7 @@ describe("Pi SessionMemory host", () => {
         rawTarget: 95_904,
         soft: 115_084,
         hard: 163_036,
+        safetyReserve: 28_772,
         observationOutputBudget: 8_192,
         observationTarget: 28_771,
         observationHigh: 47_952,
@@ -219,6 +221,39 @@ describe("Pi SessionMemory host", () => {
     expect(response.text).toBe(
       '{"protocol":"observational-memory.reflection"}',
     );
+  });
+
+  it("routes transient status and terminal actor abort effects through Pi", () => {
+    const setStatus = vi.fn();
+    const notify = vi.fn();
+    const abort = vi.fn();
+    const context = {
+      ui: { setStatus, notify },
+      abort,
+    } as unknown as ExtensionContext;
+    const host = createPiHost(
+      { appendEntry: vi.fn() } as unknown as ExtensionAPI,
+      () => context,
+    );
+
+    host.setStatus?.("observing");
+    host.setStatus?.(undefined);
+    host.abortActor?.("Exact source was preserved.");
+    host.abortActor?.();
+
+    expect(setStatus).toHaveBeenNthCalledWith(
+      1,
+      "observational-memory",
+      "observing",
+    );
+    expect(setStatus).toHaveBeenNthCalledWith(
+      2,
+      "observational-memory",
+      undefined,
+    );
+    expect(notify).toHaveBeenCalledOnce();
+    expect(notify).toHaveBeenCalledWith("Exact source was preserved.", "error");
+    expect(abort).toHaveBeenCalledTimes(2);
   });
 
   it("attributes standalone extension usage through Pi core", () => {

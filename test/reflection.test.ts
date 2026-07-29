@@ -210,6 +210,57 @@ function changedReflectionCandidate(
 }
 
 describe("SessionMemory reflection", () => {
+  it("retries the identical reflection once when hard headroom is paused", async () => {
+    const history = observedHistory(3);
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry: history.ancestry,
+      actor,
+      inputTokens: 400,
+      fixedInputTokens: 700,
+    };
+    const completeReflection = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ...reflectionCandidate([
+          "session-1:observation:1",
+          "session-1:observation:2",
+        ]),
+        text: "",
+      })
+      .mockResolvedValueOnce(
+        reflectionCandidate([
+          "session-1:observation:1",
+          "session-1:observation:2",
+        ]),
+      );
+    const appendEntry = vi.fn();
+    const memory = createSessionMemory({
+      appendEntry,
+      attributeUsage: vi.fn(),
+      estimateTokens: observationTokenEstimate,
+      async completeObservation() {
+        throw new Error("unexpected observation");
+      },
+      completeReflection,
+      setStatus: vi.fn(),
+      abortActor: vi.fn(),
+    });
+    memory.restore(snapshot);
+
+    const projected = await memory.project(snapshot, history.messages);
+
+    expect(completeReflection).toHaveBeenCalledTimes(2);
+    expect(completeReflection.mock.calls[1]?.[0]).toBe(
+      completeReflection.mock.calls[0]?.[0],
+    );
+    expect(appendEntry).toHaveBeenCalledWith(
+      "observational-memory:reflection",
+      expect.objectContaining({ id: "session-1:reflection:1" }),
+    );
+    expect(projectedMemoryContent(projected)).toContain("HISTORY:");
+  });
+
   it("does not reflect below observation high pressure", async () => {
     const history = observedHistory(2);
     const snapshot = {

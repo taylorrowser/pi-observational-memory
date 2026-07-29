@@ -158,5 +158,14 @@ export function createPiHost(
         signal,
       );
     },
+    setStatus(status) {
+      getContext()?.ui.setStatus("observational-memory", status);
+    },
+    abortActor(message) {
+      const context = getContext();
+      if (!context) return;
+      if (message) context.ui.notify(message, "error");
+      context.abort();
+    },
   };
 }
