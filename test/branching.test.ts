@@ -678,6 +678,51 @@ describe("SessionMemory branch lifecycle", () => {
     },
   );
 
+  it("does not terminally stop a restored branch when an obsolete hard pause is cancelled", async () => {
+    const first = sourcePair(1, null);
+    const second = sourcePair(2, "assistant-1");
+    const messages = [...first.messages, ...second.messages];
+    const oldSnapshot = {
+      sessionId: "session-1",
+      ancestry: [...first.entries, ...second.entries],
+      actor,
+      inputTokens: 900,
+    };
+    const destinationSnapshot = {
+      sessionId: "session-1",
+      ancestry: [] satisfies SessionEntry[],
+      actor,
+      inputTokens: 0,
+    };
+    const abortActor = vi.fn();
+    const completeObservation = vi.fn(
+      (_request: ObservationRequest, signal?: AbortSignal) =>
+        new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        }),
+    );
+    const memory = createSessionMemory({
+      appendEntry: vi.fn(),
+      attributeUsage: vi.fn(),
+      estimateTokens: (estimatedMessages) => estimatedMessages.length * 100,
+      completeObservation,
+      setStatus: vi.fn(),
+      abortActor,
+    });
+    memory.restore(oldSnapshot);
+    memory.observe(oldSnapshot);
+    const obsoleteProjection = memory.project(oldSnapshot, messages);
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+
+    memory.restore(destinationSnapshot);
+
+    expect(await obsoleteProjection).toBe(messages);
+    expect(abortActor).not.toHaveBeenCalled();
+    expect(await memory.project(destinationSnapshot, [])).toEqual([]);
+  });
+
   it("cancels old work and restores an ancestor without waiting for the old response", async () => {
     const first = sourcePair(1, null);
     const committed = observationEntry(1, "assistant-1", null);

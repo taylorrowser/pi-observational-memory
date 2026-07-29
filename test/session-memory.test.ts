@@ -100,6 +100,7 @@ describe("SessionMemory", () => {
           rawTarget: 500,
           soft: 600,
           hard: 850,
+          safetyReserve: 150,
           observationOutputBudget: 100,
           observationTarget: 150,
           observationHigh: 250,

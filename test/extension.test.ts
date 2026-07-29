@@ -7,21 +7,28 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 
 import { registerObservationalMemory } from "../src/extension.js";
-import type { SessionMemory } from "../src/session-memory.js";
+import type {
+  SessionMemory,
+  SessionMemoryHost,
+} from "../src/session-memory.js";
 
 type Handler = (event: unknown, context: ExtensionContext) => unknown;
 
 function extensionApi() {
   const handlers = new Map<string, Handler>();
   const appendEntry = vi.fn();
+  const getActiveTools = vi.fn((): string[] => []);
+  const getAllTools = vi.fn(() => []);
   const pi = {
     on(event: string, handler: Handler) {
       handlers.set(event, handler);
     },
     appendEntry,
+    getActiveTools,
+    getAllTools,
   } as unknown as ExtensionAPI;
 
-  return { pi, handlers, appendEntry };
+  return { pi, handlers, appendEntry, getActiveTools, getAllTools };
 }
 
 function context(
@@ -227,6 +234,75 @@ describe("observational-memory extension", () => {
       },
       undefined,
     );
+  });
+
+  it("includes the effective system prompt and active tool schemas in pre-request headroom", async () => {
+    const { pi, handlers, getActiveTools, getAllTools } = extensionApi();
+    getActiveTools.mockReturnValue(["read"]);
+    getAllTools.mockReturnValue([
+      {
+        name: "read",
+        description: "Read a file",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string" } },
+          required: ["path"],
+        },
+      },
+      {
+        name: "inactive",
+        description: "Must not be counted",
+        parameters: { type: "object", properties: {} },
+      },
+    ] as never[]);
+    const memory = memorySpies();
+    const ctx = {
+      signal: undefined,
+      model: {
+        provider: "anthropic",
+        id: "claude-sonnet-4-5",
+        contextWindow: 200_000,
+        maxTokens: 8_192,
+      },
+      getContextUsage: () => ({
+        tokens: 1_000,
+        contextWindow: 200_000,
+        percent: 0.5,
+      }),
+      getSystemPrompt: () => "Fixed actor instructions",
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getBranch: () => [],
+      },
+    } as unknown as ExtensionContext;
+    const messages: ContextEvent["messages"] = [
+      { role: "user", content: "Exact source", timestamp: 1 },
+    ];
+
+    let sessionHost: SessionMemoryHost | undefined;
+    registerObservationalMemory(pi, (host) => {
+      sessionHost = host;
+      return memory;
+    });
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      ctx,
+    );
+    if (!sessionHost) throw new Error("expected the session host");
+    const estimateTokens = vi.spyOn(sessionHost, "estimateTokens");
+    await handlers.get("context")?.({ type: "context", messages }, ctx);
+
+    const fixedRequest = estimateTokens.mock.calls[0]?.[0]?.[0];
+    expect(fixedRequest?.role).toBe("user");
+    if (fixedRequest?.role !== "user") throw new Error("expected fixed input");
+    expect(fixedRequest.content).toContain("Fixed actor instructions");
+    expect(fixedRequest.content).toContain("Read a file");
+    expect(fixedRequest.content).toContain('"path"');
+    expect(fixedRequest.content).not.toContain("Must not be counted");
+    const projectedSnapshot = vi.mocked(memory.project).mock.calls[0]?.[0];
+    expect(projectedSnapshot?.fixedInputTokens).toBeGreaterThan(0);
+    expect(getActiveTools).toHaveBeenCalledOnce();
+    expect(getAllTools).toHaveBeenCalledOnce();
   });
 
   it("reconstructs a resumed path and starts a new empty session without memory", async () => {

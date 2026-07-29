@@ -13,7 +13,10 @@ import {
 
 type SessionMemoryFactory = (host: SessionMemoryHost) => SessionMemory;
 
-function snapshot(context: ExtensionContext): SessionSnapshot {
+function snapshot(
+  context: ExtensionContext,
+  fixedInputTokens?: number,
+): SessionSnapshot {
   const model = context.model;
   const inputTokens = context.getContextUsage()?.tokens;
   return {
@@ -30,7 +33,34 @@ function snapshot(context: ExtensionContext): SessionSnapshot {
         }
       : {}),
     ...(inputTokens === null || inputTokens === undefined ? {} : { inputTokens }),
+    ...(fixedInputTokens === undefined || fixedInputTokens === 0
+      ? {}
+      : { fixedInputTokens }),
   };
+}
+
+function estimateFixedInputTokens(
+  pi: ExtensionAPI,
+  context: ExtensionContext,
+  host: SessionMemoryHost,
+): number {
+  const activeToolNames = new Set(pi.getActiveTools?.() ?? []);
+  const tools = (pi.getAllTools?.() ?? [])
+    .filter((tool) => activeToolNames.has(tool.name))
+    .map(({ name, description, parameters }) => ({
+      name,
+      description,
+      parameters,
+    }));
+  const systemPrompt = context.getSystemPrompt?.() ?? "";
+  if (!systemPrompt && tools.length === 0) return 0;
+  return host.estimateTokens([
+    {
+      role: "user",
+      content: JSON.stringify({ systemPrompt, tools }),
+      timestamp: 0,
+    },
+  ]);
 }
 
 export function registerObservationalMemory(
@@ -65,7 +95,7 @@ export function registerObservationalMemory(
 
     return {
       messages: await memory.project(
-        snapshot(context),
+        snapshot(context, estimateFixedInputTokens(pi, context, host)),
         event.messages,
         context.signal,
       ),
