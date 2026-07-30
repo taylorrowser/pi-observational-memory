@@ -1,6 +1,6 @@
 # Pi core compatibility patch
 
-`extension-usage.patch` is a source patch against:
+[`../patches/0001-add-observational-memory-core-capabilities.patch`](../patches/0001-add-observational-memory-core-capabilities.patch) is a source patch against:
 
 - Repository: <https://github.com/earendil-works/pi>
 - Tag: `v0.81.1`
@@ -21,7 +21,7 @@ npm ci
 npm run acceptance
 ```
 
-The published unpatched Pi 0.81.1 package does not provide the required usage ledger seam; the acceptance command always applies this pinned patch before loading the extension for model-backed scenarios.
+The published unpatched Pi 0.81.1 package does not provide the required usage ledger seam; the acceptance command always applies this pinned patch before loading the extension for model-backed scenarios. PorcuPi discovers the same tracked file as a selectable Patch Artifact.
 
 The command clones the pinned source into `.cache/`, hydrates the exact published `@earendil-works/pi-ai@0.81.1` model data, applies the patch, type-checks it, runs the affected integration tests, and builds the affected Pi packages without regenerating model data from live catalogs.
 

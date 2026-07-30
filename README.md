@@ -18,9 +18,28 @@ Observational memory cancels Pi's automatic threshold and overflow compaction. E
 
 Standalone Observer and Reflector usage is attributed through the pinned Pi core capability documented in [`pi-core/README.md`](pi-core/README.md).
 
-## Use and limitations
+## Install with PorcuPi
 
-Build and load the extension with the patched Pi 0.81.1 runtime:
+PorcuPi v0.1.0 can discover this repository as one Source Repository containing two independently selectable Artifacts:
+
+- **Extension:** `src/index.ts`
+- **Patch:** `patches/0001-add-observational-memory-core-capabilities.patch`
+
+The Extension requires the Patch, but PorcuPi intentionally does not infer dependencies. Review and select both. Give the Extension user-global or project-local Installation Scope; the Patch has no scope.
+
+```bash
+git clone https://github.com/taylorrowser/pi-observational-memory.git
+cd pi-observational-memory
+source_commit=$(git rev-parse HEAD)
+porcupi add "https://github.com/taylorrowser/pi-observational-memory@$source_commit"
+porcupi apply
+porcupi verify
+porcupi
+```
+
+`porcupi add` installs the selected Extension through Pi and records the selected Patch as pending intent. Do not use the Extension until `porcupi apply` has successfully built and activated the complete Managed Pi Composition. Future updates require another exact source commit, followed by `porcupi add`, review, `porcupi apply`, and `porcupi verify`.
+
+For repository development, build and load the extension with the locally patched Pi 0.81.1 checkout:
 
 ```bash
 npm ci
@@ -28,6 +47,8 @@ npm run acceptance
 PI_BIN=.cache/pi-core-0.81.1/packages/coding-agent/dist/cli.js npm run smoke
 .cache/pi-core-0.81.1/packages/coding-agent/dist/cli.js --extension .
 ```
+
+## Use and limitations
 
 Observational memory is ambient. Pi shows `observing` only while background work is active and a waiting status while hard headroom is being restored. Pressing Escape cancels the actor and current memory work without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
 

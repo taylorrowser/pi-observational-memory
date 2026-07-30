@@ -18,7 +18,11 @@ const aiPackage = "@earendil-works/pi-ai@0.81.1";
 const worktree = resolve(
   process.env.PI_CORE_WORKTREE ?? join(repositoryRoot, ".cache", "pi-core-0.81.1"),
 );
-const patch = join(repositoryRoot, "pi-core", "extension-usage.patch");
+const patch = join(
+  repositoryRoot,
+  "patches",
+  "0001-add-observational-memory-core-capabilities.patch",
+);
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
