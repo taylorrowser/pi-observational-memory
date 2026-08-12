@@ -397,7 +397,7 @@ describe("SessionMemory", () => {
     expect(appendEntry).not.toHaveBeenCalled();
   });
 
-  it("reconstructs a committed observation and exact uncovered tail after reload", async () => {
+  it("reconstructs a committed observation, preserves its tail, and continues a sparse audit identity", async () => {
     const firstUser: ContextEvent["messages"][number] = {
       role: "user",
       content: "Original intent",
@@ -429,7 +429,7 @@ describe("SessionMemory", () => {
     const record = {
       protocol: "observational-memory.observation",
       version: 1,
-      id: "session-1:observation:1",
+      id: "session-1:observation:2",
       replayEpoch: "session-1",
       parentCommitId: null,
       coverage: {
@@ -508,8 +508,8 @@ describe("SessionMemory", () => {
     memory.observe(reloadedSnapshot);
     expect(completeObservation).toHaveBeenCalledWith(
       expect.objectContaining({
-        passId: "session-1:observation:2",
-        parentCommitId: "session-1:observation:1",
+        passId: "session-1:observation:3",
+        parentCommitId: "session-1:observation:2",
         activeMemory: expect.objectContaining({
           observations: ["REQUEST: Preserve original intent."],
           activeTask: expect.objectContaining({

@@ -368,7 +368,7 @@ describe("SessionMemory reflection", () => {
     expect(await memory.project(snapshot, history.messages)).toEqual(projected);
   });
 
-  it("ignores an unsupported reflection without reusing its audit identity", async () => {
+  it("continues a sparse reflection audit identity after reload", async () => {
     const history = observedHistory(5);
     const firstReflection = reflectionRecord(
       1,
@@ -378,7 +378,7 @@ describe("SessionMemory reflection", () => {
     );
     const unsupportedReflection = {
       ...reflectionRecord(
-        2,
+        4,
         "session-1:reflection:1",
         ["session-1:observation:3"],
         [
@@ -420,10 +420,10 @@ describe("SessionMemory reflection", () => {
       reflectionCandidate(
         ["session-1:observation:3", "session-1:observation:4"],
         {
-          passId: "session-1:reflection:3",
+          passId: "session-1:reflection:5",
           parentReflectionId: "session-1:reflection:1",
           reflectedHistory: [
-            "REFLECTION 3: valid history after ignored generation.",
+            "REFLECTION 5: valid history after ignored generation.",
           ],
         },
       ),
@@ -446,7 +446,7 @@ describe("SessionMemory reflection", () => {
 
     expect(completeReflection).toHaveBeenCalledWith(
       expect.objectContaining({
-        passId: "session-1:reflection:3",
+        passId: "session-1:reflection:5",
         parentReflection: expect.objectContaining({
           id: "session-1:reflection:1",
         }),
@@ -461,11 +461,11 @@ describe("SessionMemory reflection", () => {
     );
     expect(appendEntry).toHaveBeenCalledWith(
       "observational-memory:reflection",
-      expect.objectContaining({ id: "session-1:reflection:3" }),
+      expect.objectContaining({ id: "session-1:reflection:5" }),
     );
     const content = projectedMemoryContent(projected);
     expect(content).toContain(
-      "REFLECTION 3: valid history after ignored generation.",
+      "REFLECTION 5: valid history after ignored generation.",
     );
     expect(content).toContain("OBSERVATION 5:");
     expect(content).not.toContain("REFLECTION 1:");

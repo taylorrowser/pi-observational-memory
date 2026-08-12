@@ -506,6 +506,7 @@ function parseCandidate(
     candidate.protocol !== "observational-memory.observation" ||
     candidate.version !== 1 ||
     candidate.passId !== request.passId ||
+    request.passId === expectedParentCommitId ||
     candidate.parentCommitId !== expectedParentCommitId ||
     !isStringArray(entryIds) ||
     entryIds.length !== request.source.entryIds.length ||
@@ -661,6 +662,7 @@ function parseReflectionCandidate(
     candidate.protocol !== "observational-memory.reflection" ||
     candidate.version !== 1 ||
     candidate.passId !== request.passId ||
+    request.passId === expectedParentReflectionId ||
     candidate.parentReflectionId !== expectedParentReflectionId ||
     !isStringArray(observationIds) ||
     observationIds.length !== request.coverage.observationIds.length ||
@@ -732,6 +734,27 @@ function isUsage(value: unknown): value is ExtensionUsageAttribution["usage"] {
   );
 }
 
+function memoryIdentityOrdinal(
+  value: unknown,
+  operation: "observation" | "reflection",
+): number | undefined {
+  if (
+    !isRecord(value) ||
+    !isNonemptyString(value.id) ||
+    !isNonemptyString(value.replayEpoch)
+  ) {
+    return undefined;
+  }
+  const prefix = `${value.replayEpoch}:${operation}:`;
+  if (!value.id.startsWith(prefix)) return undefined;
+  const suffix = value.id.slice(prefix.length);
+  if (!/^[1-9]\d*$/.test(suffix)) return undefined;
+  const ordinal = Number(suffix);
+  return Number.isSafeInteger(ordinal) && ordinal < Number.MAX_SAFE_INTEGER
+    ? ordinal
+    : undefined;
+}
+
 function hasStableMemoryIdentity(
   value: Record<string, unknown>,
   operation: "observation" | "reflection",
@@ -769,6 +792,7 @@ function parsePersistedCommit(
     value.version !== 1 ||
     !hasStableMemoryIdentity(value, "observation") ||
     value.parentCommitId !== expectedParentCommitId ||
+    value.id === expectedParentCommitId ||
     value.lineage.parentCommitId !== expectedParentCommitId ||
     !isStringArray(entryIds) ||
     entryIds.length === 0 ||
@@ -852,6 +876,7 @@ function parsePersistedReflection(
     value.version !== 1 ||
     !hasStableMemoryIdentity(value, "reflection") ||
     value.parentReflectionId !== expectedParentReflectionId ||
+    value.id === expectedParentReflectionId ||
     value.lineage.parentReflectionId !== expectedParentReflectionId ||
     !isStringArray(observationIds) ||
     observationIds.length === 0 ||
@@ -924,6 +949,8 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
   let coveredCount = 0;
   let observationEntryCount = 0;
   let reflectionEntryCount = 0;
+  let greatestObservationOrdinal = 0;
+  let greatestReflectionOrdinal = 0;
   const compactionIndex = latestCompaction(snapshot.ancestry)?.index ?? -1;
   const postCompactionIds = new Set(
     snapshot.ancestry.slice(compactionIndex + 1).map((entry) => entry.id),
@@ -945,8 +972,12 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
     const isPhysicallyContiguous = entry.parentId === expectedPhysicalParentId;
     if (isObservationEntry(entry)) {
       observationEntryCount += 1;
-      if (!isPhysicallyContiguous) continue;
       const data = entry.data;
+      greatestObservationOrdinal = Math.max(
+        greatestObservationOrdinal,
+        memoryIdentityOrdinal(data, "observation") ?? 0,
+      );
+      if (!isPhysicallyContiguous) continue;
       const coverage =
         isRecord(data) && isRecord(data.coverage)
           ? data.coverage.entryIds
@@ -972,8 +1003,12 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
 
     if (isReflectionEntry(entry)) {
       reflectionEntryCount += 1;
-      if (!isPhysicallyContiguous) continue;
       const data = entry.data;
+      greatestReflectionOrdinal = Math.max(
+        greatestReflectionOrdinal,
+        memoryIdentityOrdinal(data, "reflection") ?? 0,
+      );
+      if (!isPhysicallyContiguous) continue;
       const coverage =
         isRecord(data) && isRecord(data.coverage)
           ? data.coverage.observationIds
@@ -1000,8 +1035,14 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
   return {
     commits,
     reflections,
-    observationEntryCount,
-    reflectionEntryCount,
+    observationEntryCount: Math.max(
+      observationEntryCount,
+      greatestObservationOrdinal,
+    ),
+    reflectionEntryCount: Math.max(
+      reflectionEntryCount,
+      greatestReflectionOrdinal,
+    ),
   };
 }
 
