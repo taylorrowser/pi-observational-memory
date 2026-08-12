@@ -374,7 +374,7 @@ async function runScenario(name, mode) {
         readFileSync(artifact, "utf8") === `EVIDENCE:${name}:${index}`
       );
     });
-    const betweenModelStepActivation =
+    const memoryProjectedBeforeExactTail =
       activeContexts.length === 0 ||
       activeContexts.some((text) => !text.includes(`EXACT_TAIL:${name}`));
     const exactTailPreserved =
@@ -429,31 +429,47 @@ async function runScenario(name, mode) {
           .map(contextTokens)
           .join(", ")})`,
       ),
-      completeModelSteps: invariant(
+      recordDeclaresCompleteResponseValidation: invariant(
         records.every((entry) =>
           entry.data.validation.checks.includes("complete-response"),
         ),
-        `${name}: incomplete boundary activated`,
+        `${name}: record lacks complete-response validation metadata`,
       ),
-      contiguousCoverage: invariant(
+      recordDeclaresContiguousCoverageValidation: invariant(
         records.every((entry) =>
           entry.data.validation.checks.some((check) => check.includes("contiguous")),
         ),
-        `${name}: non-contiguous coverage activated`,
+        `${name}: record lacks contiguous-coverage validation metadata`,
       ),
-      validParentage: invariant(
-        records.every(
-          (entry) =>
-            entry.data.parentCommitId === entry.data.lineage.parentCommitId ||
-            entry.data.parentReflectionId ===
-              entry.data.lineage.parentReflectionId,
-        ),
-        `${name}: invalid parentage activated`,
+      recordLineageFieldsAgree: invariant(
+        records.every((entry) => {
+          if (
+            entry.data.protocol === "observational-memory.observation"
+          ) {
+            return (
+              entry.data.parentCommitId ===
+              entry.data.lineage.parentCommitId
+            );
+          }
+          if (
+            entry.data.protocol === "observational-memory.reflection"
+          ) {
+            return (
+              entry.data.parentReflectionId ===
+              entry.data.lineage.parentReflectionId
+            );
+          }
+          return false;
+        }),
+        `${name}: record lineage fields disagree`,
       ),
-      atomicActivation: invariant(
-        (activeContexts.length === 0 || records.length > 0) &&
-          betweenModelStepActivation,
-        `${name}: memory did not activate atomically between model steps`,
+      projectedMemoryBackedByPersistedRecord: invariant(
+        activeContexts.length === 0 || records.length > 0,
+        `${name}: actor request projected memory without a persisted record`,
+      ),
+      memoryProjectedBeforeExactTail: invariant(
+        memoryProjectedBeforeExactTail,
+        `${name}: memory was not projected before the exact-tail probe`,
       ),
       evidenceBackedCompletion: invariant(
         artifactsPass,
@@ -513,8 +529,8 @@ async function runScenario(name, mode) {
       lifecycle,
       actorMaximumContext,
       observation: {
-        activations: activeContexts.length,
-        betweenModelSteps: betweenModelStepActivation,
+        projectedRequestsWithMemory: activeContexts.length,
+        projectedBeforeExactTail: memoryProjectedBeforeExactTail,
         calls: memoryCalls.observation,
         usage: observationUsage,
       },
@@ -557,7 +573,7 @@ async function runScenario(name, mode) {
   }
 }
 
-function verifyFailureEvidence() {
+function verifyFocusedFailureTests() {
   const result = spawnSync(
     process.execPath,
     [
@@ -572,34 +588,25 @@ function verifyFailureEvidence() {
     ],
     { cwd: root, stdio: "inherit" },
   );
-  invariant(result.status === 0, "Focused failure evidence did not pass");
-  return [
-    {
-      name: "malformed-output",
-      sourcePreserved: true,
-      evidence: "hard-headroom: two invalid hard-paused attempts",
-    },
-    {
-      name: "delayed-work",
-      sourcePreserved: true,
-      evidence: "branching: obsolete delayed response is fenced",
-    },
-    {
-      name: "hard-pause-retry",
-      sourcePreserved: true,
-      evidence: "hard-headroom: identical frozen pass retries once",
-    },
-    {
-      name: "cancellation",
-      sourcePreserved: true,
-      evidence: "hard-headroom: cancelled late response never activates",
-    },
-    {
-      name: "terminal-stop",
-      sourcePreserved: true,
-      evidence: "hard-headroom: retry exhaustion aborts without coverage",
-    },
-  ];
+  invariant(result.status === 0, "Focused failure tests did not pass");
+  return {
+    runner: "vitest",
+    result: "passed",
+    testFiles: [
+      "test/session-memory.test.ts",
+      "test/reflection.test.ts",
+      "test/hard-headroom.test.ts",
+      "test/branching.test.ts",
+      "test/lifecycle.test.ts",
+    ],
+    coveredBehaviors: [
+      "malformed hard-paused output preserves source after retry exhaustion",
+      "obsolete delayed work is fenced after branch navigation",
+      "hard-paused observation retries the identical frozen request once",
+      "cancelled late work never activates",
+      "terminal retry exhaustion aborts without advancing coverage",
+    ],
+  };
 }
 
 async function verifySessionReplacement() {
@@ -658,11 +665,14 @@ async function run() {
   }
 
   const short = scenarios.find((scenario) => scenario.name === "short");
-  invariant(short.runs[0].observation.activations === 0, "Short run activated memory");
+  invariant(
+    short.runs[0].observation.projectedRequestsWithMemory === 0,
+    "Short run projected memory",
+  );
   for (const scenario of scenarios.filter((item) => item.name !== "short")) {
     invariant(
-      scenario.runs[0].observation.activations > 0,
-      `${scenario.name}: no observation activated`,
+      scenario.runs[0].observation.projectedRequestsWithMemory > 0,
+      `${scenario.name}: no actor request was projected with memory`,
     );
   }
   const repeated = scenarios.find(
@@ -678,7 +688,7 @@ async function run() {
     runtimeLifecycle.chainedContextExtension,
     "Chained context-extension smoke failed",
   );
-  const failures = verifyFailureEvidence();
+  const focusedFailureTests = verifyFocusedFailureTests();
   const sessionReplacement = await verifySessionReplacement();
   const report = {
     configurations: {
@@ -687,7 +697,7 @@ async function run() {
       provider: "faux",
     },
     scenarios,
-    failures,
+    focusedFailureTests,
     lifecycle: {
       branchNavigation: runtimeLifecycle.branchNavigation ? "passed" : "failed",
       modelSelection: runtimeLifecycle.modelSelection ? "passed" : "failed",
@@ -700,7 +710,10 @@ async function run() {
         : "failed",
     },
     conclusions: [
-      "Results apply only to this deterministic faux-provider configuration.",
+      "Scenario results apply only to this deterministic faux-provider configuration.",
+      "Headroom, durable artifacts, exact source recovery, exact tail preservation, repeated work, and lifecycle outcomes are checked independently by the acceptance harness.",
+      "Record validation labels are production metadata checked for presence; they are not an independent replay of production validation.",
+      "Malformed output, delayed work, retry, cancellation, and terminal-stop behavior are backed by the listed focused Vitest files rather than separate acceptance scenarios.",
       "The evidence demonstrates bounded actor context; it makes no universal cost or task-quality claim.",
     ],
   };
