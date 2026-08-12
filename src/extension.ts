@@ -85,7 +85,7 @@ export function registerObservationalMemory(
   });
 
   pi.on("session_before_compact", (event, context) => {
-    if (event.reason !== "manual") return { cancel: true };
+    if (event.reason === "threshold") return { cancel: true };
     if (!memory) return;
     currentContext = context;
     memory.restore(snapshot(context));

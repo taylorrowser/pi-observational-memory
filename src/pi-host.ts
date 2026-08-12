@@ -6,15 +6,10 @@ import {
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 
 import type {
-  ExtensionUsageAttribution,
   ObservationRequest,
   ReflectionRequest,
   SessionMemoryHost,
 } from "./session-memory.js";
-
-type UsageCapablePi = ExtensionAPI & {
-  appendUsage(attribution: ExtensionUsageAttribution): void;
-};
 
 type ContextProvider = () => ExtensionContext | undefined;
 type CompleteModel = typeof completeSimple;
@@ -121,9 +116,6 @@ export function createPiHost(
   return {
     appendEntry(customType, data) {
       pi.appendEntry(customType, data);
-    },
-    attributeUsage(attribution) {
-      (pi as UsageCapablePi).appendUsage(attribution);
     },
     estimateTokens(messages) {
       return messages.reduce(

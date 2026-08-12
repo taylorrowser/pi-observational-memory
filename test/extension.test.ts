@@ -407,7 +407,7 @@ describe("observational-memory extension", () => {
     expect(childMemory.observe).not.toHaveBeenCalled();
   });
 
-  it("cancels automatic compaction but preserves explicit compaction as a replay boundary", async () => {
+  it("owns threshold compaction and lets stock Pi recover from overflow", async () => {
     const { pi, handlers } = extensionApi();
     const memory = memorySpies();
     const beforeAncestry: SessionEntry[] = [];
@@ -452,7 +452,7 @@ describe("observational-memory extension", () => {
     );
 
     expect(thresholdResult).toEqual({ cancel: true });
-    expect(overflowResult).toEqual({ cancel: true });
+    expect(overflowResult).toBeUndefined();
     expect(manualResult).toBeUndefined();
     expect(memory.restore).toHaveBeenNthCalledWith(1, {
       sessionId: "session-1",
@@ -463,6 +463,10 @@ describe("observational-memory extension", () => {
       ancestry: beforeAncestry,
     });
     expect(memory.restore).toHaveBeenNthCalledWith(3, {
+      sessionId: "session-1",
+      ancestry: beforeAncestry,
+    });
+    expect(memory.restore).toHaveBeenNthCalledWith(4, {
       sessionId: "session-1",
       ancestry: afterAncestry,
     });

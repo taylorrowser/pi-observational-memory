@@ -8,24 +8,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { pathToFileURL, fileURLToPath } from "node:url";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import * as codingAgent from "@earendil-works/pi-coding-agent";
+import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import * as compat from "@earendil-works/pi-ai/compat";
 import observationalMemory from "../dist/index.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const piRoot = resolve(
-  process.env.PI_CORE_WORKTREE ?? join(root, ".cache", "pi-core-0.81.1"),
-);
-const codingAgent = await import(
-  pathToFileURL(join(piRoot, "packages/coding-agent/dist/index.js"))
-);
-const cacheAi = await import(
-  pathToFileURL(join(piRoot, "packages/ai/dist/index.js"))
-);
-const cacheCompat = await import(
-  pathToFileURL(join(piRoot, "packages/ai/dist/compat.js"))
-);
-const rootCompat = await import("@earendil-works/pi-ai/compat");
 
 const {
   createAgentSession,
@@ -39,7 +29,6 @@ const {
   SessionManager,
   SettingsManager,
 } = codingAgent;
-const { InMemoryCredentialStore } = cacheAi;
 const { Type } = await import("typebox");
 
 const modes = ["observational-memory", "full-history", "stock-compaction"];
@@ -120,7 +109,7 @@ function evidenceMarkers(value) {
 function observerResponse(context) {
   const payload = memoryPayload(context);
   const markers = evidenceMarkers(payload.source);
-  return rootCompat.fauxAssistantMessage(
+  return compat.fauxAssistantMessage(
     JSON.stringify({
       protocol: "observational-memory.observation",
       version: 1,
@@ -152,7 +141,7 @@ function observerResponse(context) {
 
 function reflectorResponse(context) {
   const payload = memoryPayload(context);
-  return rootCompat.fauxAssistantMessage(
+  return compat.fauxAssistantMessage(
     JSON.stringify({
       protocol: "observational-memory.reflection",
       version: 1,
@@ -193,10 +182,7 @@ async function runScenario(name, mode) {
     { id: "primary", ...actorModel },
     { id: "alternate", ...alternateActorModel },
   ];
-  // Pi's patched runtime and the built extension resolve separate pi-ai copies.
-  // Mirror one faux API across both so actor and memory calls share a model identity.
-  const actorFaux = cacheCompat.registerFauxProvider({ provider, api, models });
-  const memoryFaux = rootCompat.registerFauxProvider({ provider, api, models });
+  const faux = compat.registerFauxProvider({ provider, api, models });
   const actorContexts = [];
   const toolCalls = [];
   const memoryCalls = { observation: 0, reflection: 0 };
@@ -210,7 +196,7 @@ async function runScenario(name, mode) {
       context.systemPrompt?.includes("context summarization assistant") ||
       contextText(context).includes("Summarize the prefix")
     ) {
-      return cacheCompat.fauxAssistantMessage(
+      return compat.fauxAssistantMessage(
         "Stock Pi summary of completed acceptance steps.",
       );
     }
@@ -222,34 +208,34 @@ async function runScenario(name, mode) {
       pausedAt !== actorStep
     ) {
       pausedAt = actorStep;
-      return cacheCompat.fauxAssistantMessage(
+      return compat.fauxAssistantMessage(
         `BATCH_OK:${name}:${actorStep}`,
       );
     }
     if (pausedAt === actorStep) pausedAt = undefined;
     if (actorStep < sizes.length) {
       const index = actorStep++;
-      return cacheCompat.fauxAssistantMessage(
-        cacheCompat.fauxToolCall(
+      return compat.fauxAssistantMessage(
+        compat.fauxToolCall(
           "acceptance_step",
           { index },
           { id: `step-${index}` },
         ),
       );
     }
-    return cacheCompat.fauxAssistantMessage(`ACCEPTANCE_OK:${name}`);
+    return compat.fauxAssistantMessage(`ACCEPTANCE_OK:${name}`);
   };
-  actorFaux.setResponses(Array.from({ length: 100 }, () => actorResponse));
-  memoryFaux.setResponses(
-    Array.from({ length: 100 }, () => (context) => {
+  faux.setResponses(
+    Array.from({ length: 200 }, () => (context) => {
       if (context.systemPrompt?.startsWith("You are the Observer")) {
-        const response = observerResponse(context);
         memoryCalls.observation += 1;
-        return response;
+        return observerResponse(context);
       }
-      const response = reflectorResponse(context);
-      memoryCalls.reflection += 1;
-      return response;
+      if (context.systemPrompt?.startsWith("You are the Reflector")) {
+        memoryCalls.reflection += 1;
+        return reflectorResponse(context);
+      }
+      return actorResponse(context);
     }),
   );
 
@@ -263,7 +249,7 @@ async function runScenario(name, mode) {
   const modelRuntime = await ModelRuntime.create({
     credentials: new InMemoryCredentialStore(),
   });
-  modelRuntime.registerProvider(provider, providerConfig(actorFaux));
+  modelRuntime.registerProvider(provider, providerConfig(faux));
   const chainedContext = (pi) => {
     pi.on("context", (event) => ({
       messages: [
@@ -301,7 +287,7 @@ async function runScenario(name, mode) {
     },
   });
   const { session } = await createAgentSession({
-    model: actorFaux.getModel(),
+    model: faux.getModel(),
     modelRuntime,
     resourceLoader,
     sessionManager,
@@ -309,7 +295,7 @@ async function runScenario(name, mode) {
     customTools: [tool],
     tools: ["acceptance_step"],
   });
-  session.agent.streamFunction = cacheCompat.streamSimple;
+  session.agent.streamFunction = compat.streamSimple;
   const uiContext = new Proxy(
     {},
     {
@@ -404,16 +390,21 @@ async function runScenario(name, mode) {
       canonicalSource.includes(`EVIDENCE:${name}:${index}`),
     );
     invariant(exactSourceRecovery, `${name}: canonical exact source was lost`);
-    const usageEntries = entries.filter(
-      (entry) => entry.type === "extension_usage",
+    const observationRecords = records.filter(
+      (entry) => entry.data.protocol === "observational-memory.observation",
     );
-    const observationUsage = usageEntries
-      .filter((entry) => entry.operation.endsWith(":observation"))
-      .reduce((total, entry) => total + entry.usage.totalTokens, 0);
-    const reflectionUsage = usageEntries
-      .filter((entry) => entry.operation.endsWith(":reflection"))
-      .reduce((total, entry) => total + entry.usage.totalTokens, 0);
-    const attributedCalls =
+    const reflectionRecords = records.filter(
+      (entry) => entry.data.protocol === "observational-memory.reflection",
+    );
+    const observationUsage = observationRecords.reduce(
+      (total, entry) => total + entry.data.usage.totalTokens,
+      0,
+    );
+    const reflectionUsage = reflectionRecords.reduce(
+      (total, entry) => total + entry.data.usage.totalTokens,
+      0,
+    );
+    const completedMemoryCalls =
       memoryCalls.observation + memoryCalls.reflection;
     const actorMaximumContext = Math.max(0, ...actorContexts.map(contextTokens));
     const safeHeadroom = actorContexts.every(
@@ -428,27 +419,6 @@ async function runScenario(name, mode) {
       artifactsPass &&
       session.messages.map(textOf).join("\n").includes(`ACCEPTANCE_OK:${name}`) &&
       toolCalls.length === uniqueCalls.size;
-    const stats = session.getSessionStats();
-    const ledgerUsage = entries.reduce(
-      (totals, entry) => {
-        const usage =
-          entry.type === "extension_usage" || entry.type === "compaction"
-            ? entry.usage
-            : entry.type === "message" && entry.message.role === "assistant"
-              ? entry.message.usage
-              : undefined;
-        if (usage) {
-          totals.input += usage.input;
-          totals.output += usage.output;
-          totals.cacheRead += usage.cacheRead;
-          totals.cacheWrite += usage.cacheWrite;
-          totals.total += usage.totalTokens;
-        }
-        return totals;
-      },
-      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    );
-
     const chainedContextPassed =
       mode !== "observational-memory" ||
       projectedTexts.every((text) => text.includes("CHAINED_CONTEXT_SENTINEL"));
@@ -493,12 +463,13 @@ async function runScenario(name, mode) {
         exactTailPreserved && chainedContextPassed,
         `${name}: exact tail or chained context was not preserved`,
       ),
-      usageExactlyOnce: invariant(
-        usageEntries.length === attributedCalls &&
-          new Set(usageEntries.map((entry) => entry.passId)).size ===
-            usageEntries.length &&
-          JSON.stringify(stats.tokens) === JSON.stringify(ledgerUsage),
-        `${name}: Pi did not attribute every returned memory call exactly once`,
+      memoryUsageAuditable: invariant(
+        records.length === completedMemoryCalls &&
+          new Set(records.map((entry) => entry.data.id)).size === records.length &&
+          records.every((entry) =>
+            Number.isFinite(entry.data.usage.totalTokens),
+          ),
+        `${name}: persisted memory usage was incomplete`,
       ),
     };
 
@@ -509,7 +480,7 @@ async function runScenario(name, mode) {
       chainedContextExtension: chainedContextPassed,
     };
     if (name === "repeated-contraction" && mode === "observational-memory") {
-      const alternate = actorFaux.getModel("alternate");
+      const alternate = faux.getModel("alternate");
       invariant(alternate, "Alternate acceptance model is missing");
       await session.setModel(alternate);
       await session.prompt("MODEL_SELECTION_SMOKE");
@@ -581,8 +552,7 @@ async function runScenario(name, mode) {
     };
   } finally {
     session.dispose();
-    actorFaux.unregister();
-    memoryFaux.unregister();
+    faux.unregister();
     rmSync(artifactDir, { recursive: true, force: true });
   }
 }
@@ -713,8 +683,7 @@ async function run() {
   const report = {
     configurations: {
       node: process.version,
-      pi: "0.81.1",
-      piCommit: "20be4b18d4c57487f8993d2762bace129f0cf7c6",
+      pi: codingAgent.VERSION ?? "installed stock package",
       provider: "faux",
     },
     scenarios,
@@ -731,7 +700,7 @@ async function run() {
         : "failed",
     },
     conclusions: [
-      "Results apply only to this pinned deterministic configuration.",
+      "Results apply only to this deterministic faux-provider configuration.",
       "The evidence demonstrates bounded actor context; it makes no universal cost or task-quality claim.",
     ],
   };

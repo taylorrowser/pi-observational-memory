@@ -112,7 +112,6 @@ async function runChain(factories: readonly ExtensionFactory[]) {
       handlers.set(event, existing);
     },
     appendEntry: vi.fn(),
-    appendUsage: vi.fn(),
     getActiveTools: () => [],
     getAllTools: () => [],
   } as unknown as ExtensionAPI;

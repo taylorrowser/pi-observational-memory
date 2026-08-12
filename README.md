@@ -14,49 +14,42 @@ Context hooks compose conservatively. Covered Pi-built source is replaced only w
 
 Actor-model changes recompute every pressure and request-headroom budget without invalidating committed memory or changing its producer provenance. Completed passes frozen under an earlier model may still activate when their ancestry and coverage remain valid. Failed, aborted, and partial assistant responses remain exact until a later complete boundary, and terminal tool failures remain explicitly failed evidence.
 
-Observational memory cancels Pi's automatic threshold and overflow compaction. Explicit `/compact` remains available: it cancels pre-compaction memory work and creates a fresh replay epoch where Pi's summary and retained tail become authoritative. Navigating before that compaction entry restores the earlier valid observational epoch. Session replacement and shutdown fence old work before rebinding, and responses returned after that fence append neither memory nor usage to a new session.
+Observational memory cancels Pi's proactive threshold compaction. Explicit `/compact` remains available, and Pi's normal overflow compaction remains a last-resort fallback if a provider rejects a request despite the extension's headroom checks. Either compaction starts a fresh replay epoch where Pi's summary and retained tail become authoritative. Navigating before that compaction entry restores the earlier valid observational epoch. Session replacement and shutdown fence old work before rebinding, and responses returned after that fence append no memory to a new session.
 
-Standalone Observer and Reflector usage is attributed through the pinned Pi core capability documented in [`pi-core/README.md`](pi-core/README.md).
+Observer and Reflector usage is retained on persisted memory records for audit. Stock Pi does not include those private background calls in its footer or `/session` totals.
 
-## Install with PorcuPi
+## Install
 
-PorcuPi v0.1.0 can discover this repository as one Source Repository containing two independently selectable Artifacts:
-
-- **Extension:** `src/index.ts`
-- **Patch:** `patches/0001-add-observational-memory-core-capabilities.patch`
-
-The Extension requires the Patch, but PorcuPi intentionally does not infer dependencies. Review and select both. Give the Extension user-global or project-local Installation Scope; the Patch has no scope.
+Install directly from Git as a normal Pi package:
 
 ```bash
-git clone https://github.com/taylorrowser/pi-observational-memory.git
-cd pi-observational-memory
-source_commit=$(git rev-parse HEAD)
-porcupi add "https://github.com/taylorrowser/pi-observational-memory@$source_commit"
-porcupi apply
-porcupi verify
-porcupi
+pi install git:github.com/taylorrowser/pi-observational-memory
 ```
 
-`porcupi add` installs the selected Extension through Pi and records the selected Patch as pending intent. Do not use the Extension until `porcupi apply` has successfully built and activated the complete Managed Pi Composition. Future updates require another exact source commit, followed by `porcupi add`, review, `porcupi apply`, and `porcupi verify`.
+For a project-local installation:
 
-For repository development, build and load the extension with the locally patched Pi 0.81.1 checkout:
+```bash
+pi install git:github.com/taylorrowser/pi-observational-memory -l
+```
+
+Restart Pi after installation. Use `pi list` to confirm the package and `pi config` to enable or disable it.
+
+To try a local checkout without installing it:
 
 ```bash
 npm ci
-npm run acceptance
-PI_BIN=.cache/pi-core-0.81.1/packages/coding-agent/dist/cli.js npm run smoke
-.cache/pi-core-0.81.1/packages/coding-agent/dist/cli.js --extension .
+pi --extension .
 ```
 
 ## Use and limitations
 
 Observational memory is ambient. Pi shows `observing` only while background work is active and a waiting status while hard headroom is being restored. Pressing Escape cancels the actor and current memory work without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
 
-Automatic threshold and overflow compaction are disabled while the extension is loaded. Explicit `/compact` remains a deliberate override and starts a new observational replay epoch. The first version has one built-in policy: there are no settings, memory inspector, memory command, or always-present status. Derived memory remains fallible, exact source remains canonical, and the extension makes no universal cost, latency, or task-quality claim.
+Automatic threshold compaction is disabled while the extension is loaded. Explicit `/compact` remains a deliberate override, and stock overflow compaction remains an emergency fallback; either starts a new observational replay epoch. The first version has one built-in policy: there are no settings, memory inspector, memory command, or always-present status. Derived memory remains fallible, exact source remains canonical, and the extension makes no universal cost, latency, or task-quality claim.
 
 ## Acceptance evidence
 
-`npm run acceptance` is the repeatable clean-checkout acceptance command. It builds and smoke-loads the extension, builds the pinned patched Pi runtime, runs the deterministic suite and Pi integration/RPC checks, and then runs five paired faux-provider scenarios through Pi's real SDK runtime:
+`npm run acceptance` is the repeatable clean-checkout acceptance command. It builds and smoke-loads the extension, runs the deterministic suite, and then runs five paired faux-provider scenarios through the installed stock Pi SDK runtime:
 
 - short/no activation;
 - steady context growth;
@@ -66,11 +59,11 @@ Automatic threshold and overflow compaction are disabled while the extension is 
 
 Each scenario compares observational memory, exact full-history replay, and stock Pi compaction where applicable. The harness enforces safe actor headroom and valid atomic coverage, writes and evaluates durable tool artifacts, verifies an exact uncovered tail and canonical-source recovery, and reports actor maximum context, observation/reflection usage, hard-wait count and duration, cache reads, repeated work, compactions, and task outcome separately. Focused failure and real-runtime lifecycle smokes cover malformed or delayed work, retry, cancellation, terminal stop, branch navigation, model selection, session replacement, explicit compaction, and chained context extensions.
 
-The auditable JSON report is written to `.cache/acceptance-report.json`. Results apply only to the pinned deterministic configuration and demonstrate bounded-context behavior, not general model quality or economics.
+The auditable JSON report is written to `.cache/acceptance-report.json`. It reports memory-call usage from persisted observation and reflection records; stock Pi's session totals do not include that background usage. Results apply only to the deterministic faux-provider configuration and demonstrate bounded-context behavior, not general model quality or economics.
 
 ## Development
 
-Requires Node.js 22.19 or newer and Pi 0.81.1.
+Requires Node.js 22.19 or newer and Pi 0.81.1 or newer.
 
 ```bash
 npm install
@@ -78,13 +71,10 @@ npm run typecheck
 npm test
 npm run build
 npm run smoke
-npm run pi-core:check
 npm run acceptance
 ```
 
-`npm run smoke` builds the package and loads its Pi package manifest in the installed `pi` CLI without making a provider request. Set `PI_BIN` to test a specific Pi executable.
-
-`npm run pi-core:check` clones the declared Pi version into `.cache/`, applies the standalone extension-usage patch, and runs its typecheck, integration tests, and offline build. See [`pi-core/README.md`](pi-core/README.md).
+`npm run smoke` builds the package and loads its Pi package manifest in the installed `pi` CLI without making a provider request. Set `PI_BIN` to test a specific Pi executable. `npm run acceptance` exercises the extension through the installed stock Pi SDK runtime.
 
 ## Load locally
 

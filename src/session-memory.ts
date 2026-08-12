@@ -191,7 +191,8 @@ interface ReadyObservation {
 
 export interface SessionMemoryHost {
   appendEntry(customType: string, data?: unknown): void;
-  attributeUsage(attribution: ExtensionUsageAttribution): void;
+  /** Optional instrumentation for hosts that track standalone model usage. */
+  attributeUsage?(attribution: ExtensionUsageAttribution): void;
   estimateTokens(messages: ContextEvent["messages"]): number;
   completeObservation(
     request: ObservationRequest,
@@ -473,7 +474,7 @@ function parseCandidate(
   response: ObservationResponse,
   expectedParentCommitId: string | null,
 ): ObservationCommit | undefined {
-  host.attributeUsage({
+  host.attributeUsage?.({
     usage: response.usage,
     provider: response.provider,
     model: response.model,
@@ -628,7 +629,7 @@ function parseReflectionCandidate(
   response: ReflectionResponse,
   activeReflection: ReflectionGeneration | undefined,
 ): ReflectionGeneration | undefined {
-  host.attributeUsage({
+  host.attributeUsage?.({
     usage: response.usage,
     provider: response.provider,
     model: response.model,
