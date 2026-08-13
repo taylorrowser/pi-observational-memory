@@ -115,6 +115,50 @@ describe("SessionMemory control plane", () => {
     );
   });
 
+  it("starts another ambient observation when the uncovered message layer reaches its threshold", async () => {
+    const initial = history(3);
+    const expanded = history(4);
+    const completeObservation = vi.fn(async (request) => candidate(request));
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      messageTokensTarget: 200,
+      messageTokensStartObservation: 400,
+      observationTokensStartReflection: 10_000,
+    };
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        estimateTokens(messages) {
+          return messages.length * 100;
+        },
+        completeObservation,
+      },
+      settings,
+    );
+    const initialSnapshot = {
+      sessionId: "session-1",
+      ancestry: initial.ancestry,
+      actor,
+      inputTokens: 600,
+    };
+    memory.restore(initialSnapshot);
+    await memory.compact(initialSnapshot);
+
+    const expandedSnapshot = {
+      sessionId: "session-1",
+      ancestry: expanded.ancestry,
+      actor,
+      // Pi reports projected actor context here, which can remain below the
+      // threshold while the exact uncovered source grows beyond it.
+      inputTokens: 250,
+    };
+    expect(memory.inspect(expandedSnapshot).metrics.messages.percent).toBe(100);
+
+    memory.observe(expandedSnapshot);
+
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledTimes(2));
+  });
+
   it("disabling preserves exact source and enabling restores projection", async () => {
     const source = history(3);
     const memory = createSessionMemory(

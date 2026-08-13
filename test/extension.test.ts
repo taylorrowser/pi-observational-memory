@@ -95,7 +95,7 @@ function memorySpies(): SessionMemory {
 }
 
 describe("observational-memory extension", () => {
-  it("caps displayed threshold progress and omits separate memory cost", () => {
+  it("shows threshold overflow and omits separate memory cost", () => {
     expect(
       formatMemoryStatus({
         observations: [],
@@ -117,7 +117,7 @@ describe("observational-memory extension", () => {
           cost: 3.888,
         },
       }),
-    ).toBe("msg 54k (100%) • obs 8.5k (21%) • refl 0 (0%)");
+    ).toBe("msg 54k (135%) • obs 8.5k (21%) • refl 0 (0%)");
   });
 
   it("routes the selected session lifecycle through one SessionMemory", async () => {

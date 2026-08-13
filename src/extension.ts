@@ -55,7 +55,7 @@ function formatTokens(tokens: number): string {
 
 export function formatMemoryStatus(inspection: MemoryInspection): string {
   const metric = (label: string, layer: { tokens: number; percent: number }) =>
-    `${label} ${formatTokens(layer.tokens)} (${Math.min(100, Math.round(layer.percent))}%)`;
+    `${label} ${formatTokens(layer.tokens)} (${Math.round(layer.percent)}%)`;
   return [
     metric("msg", inspection.metrics.messages),
     metric("obs", inspection.metrics.observations),

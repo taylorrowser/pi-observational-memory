@@ -457,10 +457,14 @@ function frozenPrefix(
   const policy = pressurePolicy(snapshot.actor, settings);
   const allSourceEntries = sourceEntries(snapshot.ancestry);
   const uncoveredTokens = uncoveredRawTokens(host, snapshot, coveredEntryIds);
+  const actorInputTokens =
+    snapshot.inputTokens ??
+    host.estimateTokens(allSourceEntries.flatMap(entryMessages));
   const inputTokens = force
     ? uncoveredTokens
-    : (snapshot.inputTokens ??
-      host.estimateTokens(allSourceEntries.flatMap(entryMessages)));
+    : uncoveredTokens === undefined
+      ? actorInputTokens
+      : Math.max(actorInputTokens, uncoveredTokens);
   if (inputTokens === undefined || (!force && inputTokens < policy.soft)) {
     return undefined;
   }

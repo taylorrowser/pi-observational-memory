@@ -43,7 +43,7 @@ pi --extension .
 
 ## Use and limitations
 
-Observational memory is ambient. Pi shows message, observation, and reflection token-layer metrics in the extension status line; displayed threshold progress saturates at 100%. While work runs it also shows `observing`, `compacting memory`, or a hard-headroom waiting status. Pressing Escape cancels the actor and current memory work without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
+Observational memory is ambient. Pi shows message, observation, and reflection token-layer metrics in the extension status line; progress may exceed 100% while a layer remains above its configured threshold. Reaching the message threshold starts an observation pass. While work runs it also shows `observing`, `compacting memory`, or a hard-headroom waiting status. Pressing Escape cancels the actor and current memory work without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
 
 Commands:
 
