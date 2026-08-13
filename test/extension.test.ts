@@ -171,6 +171,39 @@ describe("observational-memory extension", () => {
     );
   });
 
+  it("persists routine maintenance lifecycle events without notifying the user", async () => {
+    const { pi, handlers, appendEntry } = extensionApi();
+    const ctx = context([]);
+    let host: SessionMemoryHost | undefined;
+    registerObservationalMemory(pi, (createdHost) => {
+      host = createdHost;
+      return memorySpies();
+    });
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      ctx,
+    );
+    const started: MemoryDebugEvent = {
+      protocol: "observational-memory.event",
+      version: 1,
+      event: "maintenance-started",
+      operation: "maintenance",
+      reason: "lifecycle-kick",
+      sessionId: "session-1",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      metrics: {
+        messages: { tokens: 10_000, threshold: 80_000, target: 20_000 },
+        observations: { tokens: 3_000, threshold: 40_000, target: 20_000, count: 2 },
+        reflection: { tokens: 0, limit: 5_000 },
+      },
+    };
+
+    host?.debugEvent?.(started);
+
+    expect(appendEntry).toHaveBeenCalledWith("observational-memory:event", started);
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
   it("persists settled no-op maintenance events without notifying the user", async () => {
     const { pi, handlers, appendEntry } = extensionApi();
     const ctx = context([]);
