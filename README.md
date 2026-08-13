@@ -16,7 +16,7 @@ Actor-model changes recompute every pressure and request-headroom budget without
 
 Observational memory cancels Pi's proactive threshold compaction. Explicit `/compact` performs a synchronous observational compaction toward the configured 20k exact-message target and reflects when the observation layer crosses its configured threshold. Pi's normal overflow compaction remains a last-resort fallback if a provider rejects a request despite the extension's headroom checks; that stock compaction starts a fresh replay epoch where Pi's summary and retained tail become authoritative. Navigating before that compaction entry restores the earlier valid observational epoch. Session replacement and shutdown fence old work before rebinding, and responses returned after that fence append no memory to a new session.
 
-Observer and Reflector usage is retained on persisted memory records for audit. On Pi versions with standalone extension-usage support, the calls are also included in stock footer and `/session` totals; older supported versions retain a dedicated append-only usage entry for audit.
+Observer and Reflector usage is retained on persisted memory records for audit. If Pi exposes standalone extension-usage support, the calls are also included in its stock footer and `/session` totals. Published Pi versions through 0.84.1 do not expose that API or aggregate custom usage entries, so they retain a dedicated append-only usage entry for audit but do not include it in stock overall cost.
 
 ## Install
 
@@ -43,7 +43,7 @@ pi --extension .
 
 ## Use and limitations
 
-Observational memory is ambient. Pi shows message, observation, and reflection token-layer metrics plus accumulated memory cost in the extension status line. While work runs it also shows `observing`, `compacting memory`, or a hard-headroom waiting status. Pressing Escape cancels the actor and current memory work without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
+Observational memory is ambient. Pi shows message, observation, and reflection token-layer metrics in the extension status line; displayed threshold progress saturates at 100%. While work runs it also shows `observing`, `compacting memory`, or a hard-headroom waiting status. Pressing Escape cancels the actor and current memory work without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
 
 Commands:
 

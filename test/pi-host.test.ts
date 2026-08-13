@@ -256,6 +256,38 @@ describe("Pi SessionMemory host", () => {
     expect(abort).toHaveBeenCalledTimes(2);
   });
 
+  it("attributes memory calls to Pi totals when the host supports it", () => {
+    const appendUsage = vi.fn();
+    const appendEntry = vi.fn();
+    const pi = { appendUsage, appendEntry } as unknown as ExtensionAPI;
+    const host = createPiHost(pi);
+    const attribution = {
+      usage: {
+        input: 10,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 15,
+        cost: {
+          input: 0.01,
+          output: 0.02,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 0.03,
+        },
+      },
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      operation: "observational-memory:observation" as const,
+      passId: "pass-1",
+    };
+
+    host.attributeUsage?.(attribution);
+
+    expect(appendUsage).toHaveBeenCalledWith(attribution);
+    expect(appendEntry).not.toHaveBeenCalled();
+  });
+
   it("persists standalone usage through a public compatibility fallback", () => {
     const appendEntry = vi.fn();
     const pi = { appendEntry } as unknown as ExtensionAPI;

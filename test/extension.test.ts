@@ -6,7 +6,10 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 
-import { registerObservationalMemory } from "../src/extension.js";
+import {
+  formatMemoryStatus,
+  registerObservationalMemory,
+} from "../src/extension.js";
 import type {
   SessionMemory,
   SessionMemoryHost,
@@ -92,6 +95,31 @@ function memorySpies(): SessionMemory {
 }
 
 describe("observational-memory extension", () => {
+  it("caps displayed threshold progress and omits separate memory cost", () => {
+    expect(
+      formatMemoryStatus({
+        observations: [],
+        metrics: {
+          messages: { tokens: 54_000, limit: 40_000, percent: 135 },
+          observations: {
+            tokens: 8_500,
+            limit: 40_000,
+            percent: 21.25,
+            count: 1,
+          },
+          reflection: { tokens: 0, limit: 5_000, percent: 0 },
+        },
+        usage: {
+          input: 100,
+          output: 50,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 3.888,
+        },
+      }),
+    ).toBe("msg 54k (100%) • obs 8.5k (21%) • refl 0 (0%)");
+  });
+
   it("routes the selected session lifecycle through one SessionMemory", async () => {
     const { pi, handlers, appendEntry } = extensionApi();
     const memory = memorySpies();
