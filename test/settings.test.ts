@@ -5,14 +5,17 @@ import { DEFAULT_SETTINGS, validateSettings } from "../src/settings.js";
 describe("observational-memory settings", () => {
   it("applies documented defaults and accepts bounded overrides", () => {
     expect(validateSettings({})).toEqual(DEFAULT_SETTINGS);
+    expect(DEFAULT_SETTINGS.debugLogging).toBe(false);
     expect(
       validateSettings({
         enabled: false,
+        debugLogging: true,
         messageTokensTarget: 10_000,
         messageTokensStartObservation: 30_000,
       }),
     ).toMatchObject({
       enabled: false,
+      debugLogging: true,
       messageTokensTarget: 10_000,
       messageTokensStartObservation: 30_000,
     });

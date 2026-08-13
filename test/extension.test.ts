@@ -7,10 +7,12 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  formatMemoryDebugEvent,
   formatMemoryStatus,
   registerObservationalMemory,
 } from "../src/extension.js";
 import type {
+  MemoryDebugEvent,
   SessionMemory,
   SessionMemoryHost,
 } from "../src/session-memory.js";
@@ -123,6 +125,50 @@ describe("observational-memory extension", () => {
         },
       }),
     ).toBe("msg 54k (135%) • obs 8.5k (21%) • refl 0 (0%)");
+  });
+
+  it("persists debug events and displays them inline in the TUI", async () => {
+    const { pi, handlers, appendEntry } = extensionApi();
+    const ctx = context([]);
+    let host: SessionMemoryHost | undefined;
+    registerObservationalMemory(pi, (createdHost) => {
+      host = createdHost;
+      return memorySpies();
+    });
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      ctx,
+    );
+    const event: MemoryDebugEvent = {
+      protocol: "observational-memory.event",
+      version: 1,
+      event: "observation-started",
+      operation: "observation",
+      reason: "ambient-threshold",
+      sessionId: "session-1",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      passId: "session-1:observation:1",
+      metrics: {
+        messages: { tokens: 41_300, threshold: 40_000, target: 20_000 },
+        observations: { tokens: 3_000, threshold: 40_000, target: 20_000, count: 2 },
+        reflection: { tokens: 0, limit: 5_000 },
+      },
+      coverage: { entryCount: 12 },
+    };
+
+    host?.debugEvent?.(event);
+
+    expect(appendEntry).toHaveBeenCalledWith(
+      "observational-memory:event",
+      event,
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Observation started: message history at 41.3k / 40k tokens",
+      "info",
+    );
+    expect(formatMemoryDebugEvent(event)).toBe(
+      "Observation started: message history at 41.3k / 40k tokens",
+    );
   });
 
   it("integrates observation and reflection activity into the metrics status", async () => {

@@ -59,6 +59,7 @@ Settings are stored in `~/.pi/agent/observational-memory.json` or the trusted pr
 ```json
 {
   "enabled": true,
+  "debugLogging": false,
   "messageTokensTarget": 20000,
   "messageTokensStartObservation": 40000,
   "observationTokensTarget": 20000,
@@ -78,6 +79,8 @@ Settings are stored in `~/.pi/agent/observational-memory.json` or the trusted pr
 Targets must be positive integers; each target must be lower than its corresponding start threshold. The 40k values start work and the 20k values guide contraction; none is a hard retained-layer cap. Observations retire whole completed model/tool steps and reflections fold whole observation commits, so boundaries can overshoot a target. A layer can also remain above its start threshold while work runs, awaits safe activation, or has no complete boundary available. `reflectionTokensMax` limits one generated reflection response, not the total lifetime of the reflection layer.
 
 Edits and usage records are append-only. Disabling memory immediately stops new work while retaining any already-active projected memory, so it cannot unsafely expand a large context; re-enabling reuses the validated replay epoch and catches up normally. Stock overflow compaction remains the emergency escape hatch. Derived memory remains fallible, exact source remains canonical, and the extension makes no universal cost, latency, or task-quality claim.
+
+Set `debugLogging` to `true` to append bounded `observational-memory:event` lifecycle records to the session JSONL and show matching TUI notifications. Events cover maintenance, observation, reflection, retry, hard-headroom waiting, and cancellation outcomes, with reason codes, layer metrics and thresholds, pass IDs, attempt numbers, and coverage counts where applicable. They have their own runtime timestamps and never include prompts, source content, or raw model responses. Debug events are always excluded from observer source, replay memory, and actor context. The default is `false`; when disabled, no lifecycle event entries or debug notifications are produced.
 
 ## Cost simulation
 

@@ -9,6 +9,7 @@ import {
   type ObservationRequest,
   type ObservationResponse,
 } from "../src/session-memory.js";
+import { DEFAULT_SETTINGS } from "../src/settings.js";
 
 const zeroUsage = {
   input: 0,
@@ -363,14 +364,27 @@ describe("hard headroom", () => {
     const appendEntry = vi.fn();
     const setStatus = vi.fn();
     const abortActor = vi.fn();
-    const memory = createSessionMemory({
-      appendEntry,
-      attributeUsage: vi.fn(),
-      estimateTokens: (estimatedMessages) => estimatedMessages.length * 250,
-      completeObservation,
-      setStatus,
-      abortActor,
-    });
+    const debugEvent = vi.fn();
+    const memory = createSessionMemory(
+      {
+        appendEntry,
+        debugEvent,
+        attributeUsage: vi.fn(),
+        estimateTokens: (estimatedMessages) => estimatedMessages.length * 250,
+        completeObservation,
+        setStatus,
+        abortActor,
+      },
+      {
+        ...DEFAULT_SETTINGS,
+        debugLogging: true,
+        messageTokensTarget: 200,
+        messageTokensStartObservation: 400,
+        observationTokensTarget: 100,
+        observationTokensStartReflection: 400,
+        reflectionTokensMax: 100,
+      },
+    );
     const snapshot = {
       sessionId: "session-1",
       ancestry,
@@ -393,6 +407,13 @@ describe("hard headroom", () => {
     );
     expect(setStatus).toHaveBeenLastCalledWith(
       "memory stopped — source preserved",
+    );
+    expect(debugEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "hard-headroom-terminal",
+        operation: "hard-headroom",
+        reason: "exhausted",
+      }),
     );
 
     expect(await memory.project(snapshot, messages)).toBe(messages);

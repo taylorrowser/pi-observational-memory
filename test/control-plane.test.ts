@@ -149,6 +149,190 @@ describe("SessionMemory control plane", () => {
     expect(completeObservation).not.toHaveBeenCalled();
   });
 
+  it("does not emit lifecycle telemetry when debug logging is disabled", async () => {
+    const source = history(2);
+    const debugEvent = vi.fn();
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        debugEvent,
+        estimateTokens(messages) {
+          return messages.length * 100;
+        },
+        completeObservation: async (request) => candidate(request),
+      },
+      {
+        ...DEFAULT_SETTINGS,
+        messageTokensTarget: 200,
+        messageTokensStartObservation: 400,
+      },
+    );
+    const snapshot = { sessionId: "session-1", ancestry: source.ancestry, actor };
+    memory.restore(snapshot);
+
+    await memory.maintain(() => snapshot);
+
+    expect(debugEvent).not.toHaveBeenCalled();
+  });
+
+  it("logs and announces an observation start with its triggering message metric in debug mode", async () => {
+    const source = history(2);
+    const debugEvent = vi.fn();
+    const completeObservation = vi.fn(async (request) => candidate(request));
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        debugEvent,
+        estimateTokens(messages) {
+          return messages.length * 100;
+        },
+        completeObservation,
+      },
+      {
+        ...DEFAULT_SETTINGS,
+        debugLogging: true,
+        messageTokensTarget: 200,
+        messageTokensStartObservation: 400,
+        observationTokensStartReflection: 10_000,
+      },
+    );
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry: source.ancestry,
+      actor,
+      inputTokens: 600,
+    };
+    memory.restore(snapshot);
+
+    memory.observe(snapshot);
+
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+    await memory.maintain(() => snapshot);
+    expect(debugEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        protocol: "observational-memory.event",
+        version: 1,
+        event: "observation-started",
+        operation: "observation",
+        reason: "ambient-threshold",
+        sessionId: "session-1",
+        passId: expect.any(String),
+        metrics: expect.objectContaining({
+          messages: { tokens: 400, threshold: 400, target: 200 },
+        }),
+        coverage: { entryCount: 2 },
+      }),
+    );
+    expect(debugEvent.mock.calls.map(([event]) => event.event)).toEqual([
+      "observation-started",
+      "observation-ready",
+      "maintenance-requested",
+      "maintenance-started",
+      "observation-activated",
+      "maintenance-completed",
+    ]);
+  });
+
+  it("records the bounded owner reason when background maintenance is cancelled", async () => {
+    const source = history(2);
+    const debugEvent = vi.fn();
+    const completeObservation = vi.fn(
+      (_request: unknown, signal?: AbortSignal): Promise<never> =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        }),
+    );
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        debugEvent,
+        estimateTokens(messages) {
+          return messages.length * 100;
+        },
+        completeObservation,
+      },
+      {
+        ...DEFAULT_SETTINGS,
+        debugLogging: true,
+        messageTokensTarget: 200,
+        messageTokensStartObservation: 400,
+      },
+    );
+    const snapshot = { sessionId: "session-1", ancestry: source.ancestry, actor };
+    memory.restore(snapshot);
+    const controller = new AbortController();
+
+    const maintenance = memory.maintain(() => snapshot, controller.signal);
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+    controller.abort("idle-escape");
+    await maintenance;
+
+    expect(debugEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "observation-cancelled",
+        reason: "idle-escape",
+      }),
+    );
+    expect(debugEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "maintenance-cancelled",
+        reason: "idle-escape",
+      }),
+    );
+  });
+
+  it("excludes debug telemetry from observer source and actor projection", async () => {
+    const source = history(2);
+    const debugEntry: SessionEntry = {
+      type: "custom",
+      id: "debug-event",
+      parentId: "assistant-2",
+      timestamp: "2026-01-01T00:00:03.000Z",
+      customType: "observational-memory:event",
+      data: {
+        protocol: "observational-memory.event",
+        version: 1,
+        event: "observation-started",
+        operation: "observation",
+        reason: "ambient-threshold",
+        sessionId: "session-1",
+        timestamp: "2026-01-01T00:00:03.000Z",
+        metrics: {},
+      },
+    };
+    const ancestry = [...source.ancestry, debugEntry];
+    const completeObservation = vi.fn(async (request) => candidate(request));
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        estimateTokens(messages) {
+          return messages.length * 100;
+        },
+        completeObservation,
+      },
+      {
+        ...DEFAULT_SETTINGS,
+        messageTokensTarget: 200,
+        messageTokensStartObservation: 400,
+      },
+    );
+    const snapshot = { sessionId: "session-1", ancestry, actor };
+    memory.restore(snapshot);
+
+    memory.observe(snapshot);
+
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+    const request = completeObservation.mock.calls[0]?.[0];
+    expect(request?.source.entryIds).not.toContain("debug-event");
+    expect(request?.source.entries).not.toContainEqual(debugEntry);
+    await memory.maintain(() => snapshot);
+    await expect(memory.project(snapshot, source.messages)).resolves.not.toContainEqual(
+      expect.objectContaining({ content: expect.stringContaining("observation-started") }),
+    );
+  });
+
   it("starts another ambient observation when the uncovered message layer reaches its threshold", async () => {
     const initial = history(3);
     const expanded = history(4);

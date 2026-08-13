@@ -241,8 +241,96 @@ interface ReadyObservation {
   readonly record: ObservationCommit;
 }
 
+export type MemoryDebugEventName =
+  | "maintenance-requested"
+  | "maintenance-started"
+  | "maintenance-completed"
+  | "maintenance-cancelled"
+  | "observation-started"
+  | "observation-ready"
+  | "observation-activated"
+  | "observation-rejected"
+  | "observation-failed"
+  | "observation-cancelled"
+  | "observation-retry"
+  | "reflection-started"
+  | "reflection-committed"
+  | "reflection-rejected"
+  | "reflection-failed"
+  | "reflection-cancelled"
+  | "reflection-retry"
+  | "hard-headroom-wait"
+  | "hard-headroom-terminal";
+
+export type MemoryDebugReason =
+  | "ambient-threshold"
+  | "observation-threshold"
+  | "manual-compaction"
+  | "hard-headroom"
+  | "validated"
+  | "safe-composition"
+  | "stop-reason"
+  | "empty-output"
+  | "provider-mismatch"
+  | "model-mismatch"
+  | "malformed-json"
+  | "invalid-envelope"
+  | "protocol-mismatch"
+  | "version-mismatch"
+  | "pass-mismatch"
+  | "parent-mismatch"
+  | "coverage-mismatch"
+  | "empty-observations"
+  | "incomplete-active-task"
+  | "output-budget-exceeded"
+  | "empty-source"
+  | "invalid-response"
+  | "exception"
+  | "first-attempt-failed"
+  | "lifecycle-fence"
+  | "signal-aborted"
+  | "idle-escape"
+  | "disabled"
+  | "navigation"
+  | "session-replacement"
+  | "shutdown"
+  | "lifecycle-kick"
+  | "settled"
+  | "memory-operation-running"
+  | "observation-required"
+  | "reflection-required"
+  | "cancelled"
+  | "exhausted";
+
+export interface MemoryDebugEvent {
+  readonly protocol: "observational-memory.event";
+  readonly version: 1;
+  readonly event: MemoryDebugEventName;
+  readonly operation: "maintenance" | "observation" | "reflection" | "hard-headroom";
+  readonly reason: MemoryDebugReason;
+  readonly sessionId: string;
+  readonly timestamp: string;
+  readonly passId?: string;
+  readonly attempt?: number;
+  readonly metrics: {
+    readonly messages: { readonly tokens: number; readonly threshold: number; readonly target: number };
+    readonly observations: { readonly tokens: number; readonly threshold: number; readonly target: number; readonly count: number };
+    readonly reflection: { readonly tokens: number; readonly limit: number };
+    readonly actorInputTokens?: number;
+    readonly fixedInputTokens?: number;
+    readonly hardLimit?: number;
+  };
+  readonly coverage?: {
+    readonly entryCount?: number;
+    readonly observationCount?: number;
+  };
+  readonly detail?: string;
+}
+
 export interface SessionMemoryHost {
   appendEntry(customType: string, data?: unknown): void;
+  /** Optional bounded lifecycle instrumentation. */
+  debugEvent?(event: MemoryDebugEvent): void;
   /** Optional instrumentation for hosts that track standalone model usage. */
   attributeUsage?(attribution: ExtensionUsageAttribution): void;
   estimateTokens(messages: ContextEvent["messages"]): number;
@@ -269,6 +357,7 @@ const REFLECTION_CUSTOM_TYPE = "observational-memory:reflection";
 const OBSERVATION_EDIT_CUSTOM_TYPE = "observational-memory:observation-edit";
 const REFLECTION_EDIT_CUSTOM_TYPE = "observational-memory:reflection-edit";
 const USAGE_CUSTOM_TYPE = "observational-memory:usage";
+export const DEBUG_EVENT_CUSTOM_TYPE = "observational-memory:event";
 
 function pressurePolicy(
   actor: ActorModel,
@@ -328,7 +417,8 @@ function isMemoryEntry(entry: SessionEntry): boolean {
       entry.customType === REFLECTION_CUSTOM_TYPE ||
       entry.customType === OBSERVATION_EDIT_CUSTOM_TYPE ||
       entry.customType === REFLECTION_EDIT_CUSTOM_TYPE ||
-      entry.customType === USAGE_CUSTOM_TYPE)
+      entry.customType === USAGE_CUSTOM_TYPE ||
+      entry.customType === DEBUG_EVENT_CUSTOM_TYPE)
   );
 }
 
@@ -1350,6 +1440,7 @@ export function createSessionMemory(
     | { readonly kind: "cancelled" };
   interface FrozenObservation {
     readonly request: ObservationRequest;
+    readonly snapshot: SessionSnapshot;
     readonly sessionId: string;
     readonly launchLeafId: string | null;
     readonly expectedParentCommitId: string | null;
@@ -1362,6 +1453,48 @@ export function createSessionMemory(
   let runningPromise: Promise<PassOutcome> | undefined;
   let runningObservation: FrozenObservation | undefined;
   let runningCompletion: Promise<void> | undefined;
+
+  function emitDebugEvent(
+    snapshot: SessionSnapshot,
+    event: Omit<MemoryDebugEvent, "protocol" | "version" | "sessionId" | "timestamp" | "metrics">,
+  ): void {
+    if (!settings?.debugLogging || !host.debugEvent) return;
+    const current = inspection(snapshot);
+    const policy = snapshot.actor ? pressurePolicy(snapshot.actor, settings) : undefined;
+    host.debugEvent({
+      protocol: "observational-memory.event",
+      version: 1,
+      ...(event.detail === undefined
+        ? event
+        : { ...event, detail: boundedDetail(event.detail) }),
+      sessionId: snapshot.sessionId,
+      timestamp: new Date().toISOString(),
+      metrics: {
+        messages: {
+          tokens: current.metrics.messages.tokens,
+          threshold: current.metrics.messages.limit,
+          target: settings.messageTokensTarget,
+        },
+        observations: {
+          tokens: current.metrics.observations.tokens,
+          threshold: current.metrics.observations.limit,
+          target: settings.observationTokensTarget,
+          count: current.metrics.observations.count,
+        },
+        reflection: {
+          tokens: current.metrics.reflection.tokens,
+          limit: current.metrics.reflection.limit,
+        },
+        ...(snapshot.inputTokens === undefined
+          ? {}
+          : { actorInputTokens: snapshot.inputTokens }),
+        ...(snapshot.fixedInputTokens === undefined
+          ? {}
+          : { fixedInputTokens: snapshot.fixedInputTokens }),
+        ...(policy ? { hardLimit: policy.hard } : {}),
+      },
+    });
+  }
 
   function beginRunning(): () => void {
     let resolveCompletion!: () => void;
@@ -1455,13 +1588,41 @@ export function createSessionMemory(
     }
   }
 
+  function cancellationReason(
+    signal: AbortSignal | undefined,
+  ): Extract<
+    MemoryDebugReason,
+    | "signal-aborted"
+    | "idle-escape"
+    | "disabled"
+    | "navigation"
+    | "session-replacement"
+    | "shutdown"
+  > {
+    const reason = signal?.reason;
+    switch (reason) {
+      case "idle-escape":
+      case "disabled":
+      case "navigation":
+      case "session-replacement":
+      case "shutdown":
+        return reason;
+      default:
+        return "signal-aborted";
+    }
+  }
+
+  function boundedDetail(value: string): string {
+    const compact = value.replace(/\s+/g, " ").trim();
+    return compact.length <= 160 ? compact : `${compact.slice(0, 157)}...`;
+  }
+
   function describeException(error: unknown): string {
-    const raw =
+    return boundedDetail(
       error instanceof Error
         ? `${error.name || "Error"}${error.message ? `: ${error.message}` : ""}`
-        : `non-Error rejection: ${String(error)}`;
-    const compact = raw.replace(/\s+/g, " ").trim();
-    return compact.length <= 160 ? compact : `${compact.slice(0, 157)}...`;
+        : `non-Error rejection: ${String(error)}`,
+    );
   }
 
   function describeFailure(failure: ObservationFailure): string {
@@ -1471,6 +1632,7 @@ export function createSessionMemory(
   }
 
   function stopActor(
+    snapshot: SessionSnapshot,
     kind: "cancelled" | "exhausted",
     failures: readonly ObservationFailure[] = [],
   ): void {
@@ -1488,6 +1650,12 @@ export function createSessionMemory(
             .map((failure, index) => `${index + 1}) ${describeFailure(failure)}`)
             .join("; ")}.`
         : "";
+    emitDebugEvent(snapshot, {
+      event: "hard-headroom-terminal",
+      operation: "hard-headroom",
+      reason: kind,
+      ...(failureDetails ? { detail: failureDetails } : {}),
+    });
     host.abortActor?.(
       cancelled
         ? "Observational memory was cancelled; exact source was preserved."
@@ -1519,6 +1687,7 @@ export function createSessionMemory(
     const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
     const expectedParentCommitId = newestCommit?.id ?? null;
     return {
+      snapshot,
       sessionId: snapshot.sessionId,
       launchLeafId: snapshot.ancestry.at(-1)?.id ?? null,
       expectedParentCommitId,
@@ -1556,7 +1725,19 @@ export function createSessionMemory(
     frozen: FrozenObservation,
     signal: AbortSignal | undefined,
     hardPaused: boolean,
+    trigger: "ambient-threshold" | "manual-compaction" | "hard-headroom" =
+      hardPaused ? "hard-headroom" : "ambient-threshold",
   ): Promise<PassOutcome> {
+    emitDebugEvent(
+      frozen.snapshot,
+      {
+        event: "observation-started",
+        operation: "observation",
+        reason: trigger,
+        passId: frozen.request.passId,
+        coverage: { entryCount: frozen.request.source.entryIds.length },
+      },
+    );
     running = true;
     runningObservation = frozen;
     const finishRunning = beginRunning();
@@ -1583,6 +1764,12 @@ export function createSessionMemory(
           controller.signal.aborted ||
           lifecycleRevision !== frozen.launchRevision
         ) {
+          emitDebugEvent(frozen.snapshot, {
+            event: "observation-cancelled",
+            operation: "observation",
+            reason: "lifecycle-fence",
+            passId: frozen.request.passId,
+          });
           return { kind: "cancelled" };
         }
         const candidate = parseCandidate(
@@ -1596,9 +1783,22 @@ export function createSessionMemory(
           controller.signal.aborted ||
           lifecycleRevision !== frozen.launchRevision
         ) {
+          emitDebugEvent(frozen.snapshot, {
+            event: "observation-cancelled",
+            operation: "observation",
+            reason: "lifecycle-fence",
+            passId: frozen.request.passId,
+          });
           return { kind: "cancelled" };
         }
         if (candidate.kind === "rejected") {
+          emitDebugEvent(frozen.snapshot, {
+            event: "observation-rejected",
+            operation: "observation",
+            reason: candidate.rejection.kind,
+            passId: frozen.request.passId,
+            detail: describeRejection(candidate.rejection),
+          });
           return {
             kind: "failed",
             failure: {
@@ -1613,14 +1813,36 @@ export function createSessionMemory(
           expectedParentCommitId: frozen.expectedParentCommitId,
           record: candidate.record,
         };
+        emitDebugEvent(frozen.snapshot, {
+          event: "observation-ready",
+          operation: "observation",
+          reason: "validated",
+          passId: frozen.request.passId,
+          coverage: { entryCount: frozen.request.source.entryIds.length },
+        });
         return { kind: "ready" };
       } catch (error) {
-        return controller.signal.aborted
-          ? { kind: "cancelled" }
-          : {
-              kind: "failed",
-              failure: { kind: "exception", detail: describeException(error) },
-            };
+        if (controller.signal.aborted) {
+          emitDebugEvent(frozen.snapshot, {
+            event: "observation-cancelled",
+            operation: "observation",
+            reason: cancellationReason(controller.signal),
+            passId: frozen.request.passId,
+          });
+          return { kind: "cancelled" };
+        }
+        const detail = describeException(error);
+        emitDebugEvent(frozen.snapshot, {
+          event: "observation-failed",
+          operation: "observation",
+          reason: "exception",
+          passId: frozen.request.passId,
+          detail,
+        });
+        return {
+          kind: "failed",
+          failure: { kind: "exception", detail },
+        };
       } finally {
         signal?.removeEventListener("abort", abort);
         finishRunning();
@@ -1701,6 +1923,13 @@ export function createSessionMemory(
     host.appendEntry(OBSERVATION_CUSTOM_TYPE, candidate.record);
     activeCommits.push(candidate.record);
     ready = undefined;
+    emitDebugEvent(snapshot, {
+      event: "observation-activated",
+      operation: "observation",
+      reason: "safe-composition",
+      passId: candidate.record.id,
+      coverage: { entryCount: candidate.record.coverage.entryIds.length },
+    });
     return "activated";
   }
 
@@ -1919,6 +2148,14 @@ export function createSessionMemory(
     const attempts = hardPaused ? 2 : 1;
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+      emitDebugEvent(snapshot, {
+        event: "reflection-started",
+        operation: "reflection",
+        reason: hardPaused ? "hard-headroom" : "observation-threshold",
+        passId: request.passId,
+        attempt: attempt + 1,
+        coverage: { observationCount: prefix.length },
+      });
       running = true;
       const finishRunning = beginRunning();
       const previousStatus = status;
@@ -1942,6 +2179,13 @@ export function createSessionMemory(
           controller.signal.aborted ||
           lifecycleRevision !== launchRevision
         ) {
+          emitDebugEvent(snapshot, {
+            event: "reflection-cancelled",
+            operation: "reflection",
+            reason: "lifecycle-fence",
+            passId: request.passId,
+            attempt: attempt + 1,
+          });
           return "cancelled";
         }
         const record = parseReflectionCandidate(
@@ -1962,13 +2206,52 @@ export function createSessionMemory(
         if (fenceIsValid) {
           host.appendEntry(REFLECTION_CUSTOM_TYPE, record);
           activeReflections.push(record);
+          emitDebugEvent(snapshot, {
+            event: "reflection-committed",
+            operation: "reflection",
+            reason: "validated",
+            passId: request.passId,
+            attempt: attempt + 1,
+            coverage: { observationCount: prefix.length },
+          });
           return "accepted";
         }
         if (controller.signal.aborted || lifecycleRevision !== launchRevision) {
+          emitDebugEvent(snapshot, {
+            event: "reflection-cancelled",
+            operation: "reflection",
+            reason: "lifecycle-fence",
+            passId: request.passId,
+            attempt: attempt + 1,
+          });
           return "cancelled";
         }
-      } catch {
-        if (controller.signal.aborted) return "cancelled";
+        emitDebugEvent(snapshot, {
+          event: "reflection-rejected",
+          operation: "reflection",
+          reason: "invalid-response",
+          passId: request.passId,
+          attempt: attempt + 1,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          emitDebugEvent(snapshot, {
+            event: "reflection-cancelled",
+            operation: "reflection",
+            reason: cancellationReason(controller.signal),
+            passId: request.passId,
+            attempt: attempt + 1,
+          });
+          return "cancelled";
+        }
+        emitDebugEvent(snapshot, {
+          event: "reflection-failed",
+          operation: "reflection",
+          reason: "exception",
+          passId: request.passId,
+          attempt: attempt + 1,
+          detail: describeException(error),
+        });
       } finally {
         signal?.removeEventListener("abort", abort);
         finishRunning();
@@ -1982,6 +2265,15 @@ export function createSessionMemory(
             setStatus(previousStatus);
           }
         }
+      }
+      if (attempt + 1 < attempts) {
+        emitDebugEvent(snapshot, {
+          event: "reflection-retry",
+          operation: "reflection",
+          reason: "first-attempt-failed",
+          passId: request.passId,
+          attempt: attempt + 2,
+        });
       }
     }
     return "failed";
@@ -2043,7 +2335,7 @@ export function createSessionMemory(
       enabled = next.enabled;
       if (!enabled) {
         ready = undefined;
-        runningController?.abort("observational memory disabled");
+        runningController?.abort("disabled");
         setStatus(undefined);
       }
     },
@@ -2052,7 +2344,7 @@ export function createSessionMemory(
       enabled = next;
       if (!enabled) {
         ready = undefined;
-        runningController?.abort("observational memory disabled");
+        runningController?.abort("disabled");
         setStatus(undefined);
       }
     },
@@ -2088,6 +2380,17 @@ export function createSessionMemory(
     async maintain(getSnapshot, signal) {
       let observationsCreated = 0;
       let reflectionsCreated = 0;
+      const initialSnapshot = getSnapshot();
+      emitDebugEvent(initialSnapshot, {
+        event: "maintenance-requested",
+        operation: "maintenance",
+        reason: "lifecycle-kick",
+      });
+      emitDebugEvent(initialSnapshot, {
+        event: "maintenance-started",
+        operation: "maintenance",
+        reason: "lifecycle-kick",
+      });
       while (!disposed && enabled && !terminal && !signal?.aborted) {
         const snapshot = getSnapshot();
         if (ready) {
@@ -2125,10 +2428,17 @@ export function createSessionMemory(
         const outcome = await executeObservation(frozen, signal, false);
         if (outcome.kind !== "ready") break;
       }
+      const finalSnapshot = getSnapshot();
+      emitDebugEvent(finalSnapshot, {
+        event: signal?.aborted ? "maintenance-cancelled" : "maintenance-completed",
+        operation: "maintenance",
+        reason: signal?.aborted ? cancellationReason(signal) : "settled",
+        detail: `${observationsCreated} observations, ${reflectionsCreated} reflections`,
+      });
       return {
         observationsCreated,
         reflectionsCreated,
-        inspection: inspection(getSnapshot()),
+        inspection: inspection(finalSnapshot),
       };
     },
 
@@ -2149,9 +2459,26 @@ export function createSessionMemory(
           }
           const frozen = freezeObservation(snapshot, true);
           if (!frozen) break;
-          let outcome = await executeObservation(frozen, signal, true);
+          let outcome = await executeObservation(
+            frozen,
+            signal,
+            true,
+            "manual-compaction",
+          );
           if (outcome.kind === "failed") {
-            outcome = await executeObservation(frozen, signal, true);
+            emitDebugEvent(snapshot, {
+              event: "observation-retry",
+              operation: "observation",
+              reason: "first-attempt-failed",
+              passId: frozen.request.passId,
+              attempt: 2,
+            });
+            outcome = await executeObservation(
+              frozen,
+              signal,
+              true,
+              "manual-compaction",
+            );
           }
           if (outcome.kind !== "ready") {
             throw new Error(
@@ -2165,6 +2492,13 @@ export function createSessionMemory(
           host.appendEntry(OBSERVATION_CUSTOM_TYPE, candidate.record);
           activeCommits.push(candidate.record);
           ready = undefined;
+          emitDebugEvent(snapshot, {
+            event: "observation-activated",
+            operation: "observation",
+            reason: "manual-compaction",
+            passId: candidate.record.id,
+            coverage: { entryCount: candidate.record.coverage.entryIds.length },
+          });
           observationsCreated += 1;
         }
         while (
@@ -2255,13 +2589,13 @@ export function createSessionMemory(
           activation === "ambiguous" ||
           !canCompose(snapshot, messages, activeCommits)
         ) {
-          if (isIncomingHardUnsafe(snapshot, messages)) stopActor("exhausted");
+          if (isIncomingHardUnsafe(snapshot, messages)) stopActor(snapshot, "exhausted");
           return messages;
         }
         const composition = projection(snapshot, messages);
         const projected = composition.messages;
         if (composition.ambiguous) {
-          if (isIncomingHardUnsafe(snapshot, messages)) stopActor("exhausted");
+          if (isIncomingHardUnsafe(snapshot, messages)) stopActor(snapshot, "exhausted");
           return messages;
         }
         const hardUnsafe = isHardUnsafe(snapshot, projected);
@@ -2276,11 +2610,18 @@ export function createSessionMemory(
           );
 
         if (reflectionRequired) {
-          if (hardUnsafe) setStatus("waiting for memory");
+          if (hardUnsafe) {
+            setStatus("waiting for memory");
+            emitDebugEvent(snapshot, {
+              event: "hard-headroom-wait",
+              operation: "hard-headroom",
+              reason: running ? "memory-operation-running" : "reflection-required",
+            });
+          }
           if (running) {
             if (!hardUnsafe) return projected;
             if ((await waitForRunning(signal)) === "cancelled") {
-              stopActor("cancelled");
+              stopActor(snapshot, "cancelled");
               return messages;
             }
             if (disposed || lifecycleRevision !== projectRevision) return messages;
@@ -2290,7 +2631,7 @@ export function createSessionMemory(
           if (disposed || lifecycleRevision !== projectRevision) return messages;
           if (outcome === "accepted") continue;
           if (hardUnsafe) {
-            stopActor(outcome === "cancelled" ? "cancelled" : "exhausted");
+            stopActor(snapshot, outcome === "cancelled" ? "cancelled" : "exhausted");
           }
           return projected;
         }
@@ -2301,8 +2642,13 @@ export function createSessionMemory(
         }
 
         setStatus("waiting for memory");
+        emitDebugEvent(snapshot, {
+          event: "hard-headroom-wait",
+          operation: "hard-headroom",
+          reason: running ? "memory-operation-running" : "observation-required",
+        });
         if (signal?.aborted) {
-          stopActor("cancelled");
+          stopActor(snapshot, "cancelled");
           return messages;
         }
 
@@ -2319,15 +2665,22 @@ export function createSessionMemory(
           const firstOutcome = await Promise.race([inFlight, actorAborted]);
           removeAbortListener();
           if (firstOutcome === undefined) {
-            stopActor("cancelled");
+            stopActor(snapshot, "cancelled");
             return messages;
           }
           if (disposed || lifecycleRevision !== projectRevision) return messages;
           if (firstOutcome.kind === "ready") continue;
           if (firstOutcome.kind === "cancelled") {
-            stopActor("cancelled");
+            stopActor(snapshot, "cancelled");
             return messages;
           }
+          emitDebugEvent(snapshot, {
+            event: "observation-retry",
+            operation: "observation",
+            reason: "first-attempt-failed",
+            passId: inFlightFrozen.request.passId,
+            attempt: 2,
+          });
           const retryOutcome = await executeObservation(
             inFlightFrozen,
             signal,
@@ -2335,28 +2688,35 @@ export function createSessionMemory(
           );
           if (disposed || lifecycleRevision !== projectRevision) return messages;
           if (retryOutcome.kind === "ready") continue;
-          if (retryOutcome.kind === "cancelled") stopActor("cancelled");
-          else stopActor("exhausted", [firstOutcome.failure, retryOutcome.failure]);
+          if (retryOutcome.kind === "cancelled") stopActor(snapshot, "cancelled");
+          else stopActor(snapshot, "exhausted", [firstOutcome.failure, retryOutcome.failure]);
           return messages;
         }
 
         const frozen = freezeObservation(snapshot, true);
         if (!frozen) {
-          stopActor(signal?.aborted ? "cancelled" : "exhausted");
+          stopActor(snapshot, signal?.aborted ? "cancelled" : "exhausted");
           return messages;
         }
         const firstOutcome = await executeObservation(frozen, signal, true);
         if (disposed || lifecycleRevision !== projectRevision) return messages;
         if (firstOutcome.kind === "ready") continue;
         if (firstOutcome.kind === "cancelled") {
-          stopActor("cancelled");
+          stopActor(snapshot, "cancelled");
           return messages;
         }
+        emitDebugEvent(snapshot, {
+          event: "observation-retry",
+          operation: "observation",
+          reason: "first-attempt-failed",
+          passId: frozen.request.passId,
+          attempt: 2,
+        });
         const retryOutcome = await executeObservation(frozen, signal, true);
         if (disposed || lifecycleRevision !== projectRevision) return messages;
         if (retryOutcome.kind === "ready") continue;
-        if (retryOutcome.kind === "cancelled") stopActor("cancelled");
-        else stopActor("exhausted", [firstOutcome.failure, retryOutcome.failure]);
+        if (retryOutcome.kind === "cancelled") stopActor(snapshot, "cancelled");
+        else stopActor(snapshot, "exhausted", [firstOutcome.failure, retryOutcome.failure]);
         return messages;
       }
       return messages;
@@ -2366,7 +2726,7 @@ export function createSessionMemory(
       disposed = true;
       lifecycleRevision += 1;
       ready = undefined;
-      runningController?.abort("session memory disposed");
+      runningController?.abort("shutdown");
       runningController = undefined;
       runningPromise = undefined;
       runningObservation = undefined;

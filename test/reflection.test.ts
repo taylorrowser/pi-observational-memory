@@ -2,6 +2,7 @@ import type { ContextEvent, SessionEntry } from "@earendil-works/pi-coding-agent
 import { describe, expect, it, vi } from "vitest";
 
 import { createSessionMemory } from "../src/session-memory.js";
+import { DEFAULT_SETTINGS } from "../src/settings.js";
 
 const zeroUsage = {
   input: 0,
@@ -246,17 +247,30 @@ describe("SessionMemory reflection", () => {
       );
     const appendEntry = vi.fn();
     const setStatus = vi.fn();
-    const memory = createSessionMemory({
-      appendEntry,
-      attributeUsage: vi.fn(),
-      estimateTokens: observationTokenEstimate,
-      async completeObservation() {
-        throw new Error("unexpected observation");
+    const debugEvent = vi.fn();
+    const memory = createSessionMemory(
+      {
+        appendEntry,
+        debugEvent,
+        attributeUsage: vi.fn(),
+        estimateTokens: observationTokenEstimate,
+        async completeObservation() {
+          throw new Error("unexpected observation");
+        },
+        completeReflection,
+        setStatus,
+        abortActor: vi.fn(),
       },
-      completeReflection,
-      setStatus,
-      abortActor: vi.fn(),
-    });
+      {
+        ...DEFAULT_SETTINGS,
+        debugLogging: true,
+        messageTokensTarget: 100,
+        messageTokensStartObservation: 200,
+        observationTokensTarget: 100,
+        observationTokensStartReflection: 250,
+        reflectionTokensMax: 100,
+      },
+    );
     memory.restore(snapshot);
 
     const projected = await memory.project(snapshot, history.messages);
@@ -271,6 +285,15 @@ describe("SessionMemory reflection", () => {
       expect.objectContaining({ id: "session-1:reflection:1" }),
     );
     expect(projectedMemoryContent(projected)).toContain("HISTORY:");
+    expect(debugEvent.mock.calls.map(([event]) => event.event)).toEqual(
+      expect.arrayContaining([
+        "hard-headroom-wait",
+        "reflection-started",
+        "reflection-rejected",
+        "reflection-retry",
+        "reflection-committed",
+      ]),
+    );
   });
 
   it("does not fail hard projection while session-owned reflection is running", async () => {

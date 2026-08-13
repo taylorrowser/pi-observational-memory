@@ -6,6 +6,8 @@ import type {
 import { createPiHost } from "./pi-host.js";
 import {
   createSessionMemory,
+  DEBUG_EVENT_CUSTOM_TYPE,
+  type MemoryDebugEvent,
   type MemoryInspection,
   type SessionMemory,
   type SessionMemoryHost,
@@ -51,6 +53,34 @@ function formatTokens(tokens: number): string {
   if (tokens < 1_000) return String(Math.round(tokens));
   if (tokens < 10_000) return `${(tokens / 1_000).toFixed(1)}k`;
   return `${Math.round(tokens / 1_000)}k`;
+}
+
+export function formatMemoryDebugEvent(event: MemoryDebugEvent): string {
+  const tokens = (value: number): string => {
+    if (value < 1_000) return String(Math.round(value));
+    const thousands = value / 1_000;
+    return `${Number.isInteger(thousands) ? thousands : thousands.toFixed(1)}k`;
+  };
+  const messages = `${tokens(event.metrics.messages.tokens)} / ${tokens(event.metrics.messages.threshold)} tokens`;
+  const observations = `${tokens(event.metrics.observations.tokens)} / ${tokens(event.metrics.observations.threshold)} tokens`;
+  switch (event.event) {
+    case "observation-started":
+      return `Observation started: message history at ${messages}`;
+    case "observation-ready":
+      return `Observation ready: message history at ${messages}`;
+    case "observation-activated":
+      return `Observation activated: message history at ${messages}`;
+    case "reflection-started":
+      return `Reflection started: observations at ${observations}`;
+    case "reflection-committed":
+      return `Reflection committed: observations at ${observations}`;
+    case "maintenance-started":
+      return `Memory maintenance started: ${event.reason}`;
+    case "maintenance-completed":
+      return `Memory maintenance completed: ${event.detail ?? "no work pending"}`;
+    default:
+      return `Memory ${event.event.replaceAll("-", " ")}: ${event.reason}`;
+  }
 }
 
 export function formatMemoryStatus(
@@ -114,15 +144,26 @@ export function registerObservationalMemory(
   let removeTerminalInputListener: (() => void) | undefined;
   const host: SessionMemoryHost = {
     ...piHost,
+    debugEvent(event) {
+      pi.appendEntry(DEBUG_EVENT_CUSTOM_TYPE, event);
+      currentContext?.ui.notify(formatMemoryDebugEvent(event), "info");
+    },
     setStatus(next) {
       activity = next;
       if (currentContext) refreshStatus(currentContext);
     },
   };
 
-  function stopMaintenance(): void {
+  function stopMaintenance(
+    reason:
+      | "idle-escape"
+      | "disabled"
+      | "navigation"
+      | "session-replacement"
+      | "shutdown",
+  ): void {
     maintenanceRequested = false;
-    maintenanceController?.abort();
+    maintenanceController?.abort(reason);
     maintenanceController = undefined;
     maintenanceTask = undefined;
   }
@@ -180,7 +221,7 @@ export function registerObservationalMemory(
         maintenanceController &&
         maintenanceTask
       ) {
-        stopMaintenance();
+        stopMaintenance("idle-escape");
         return { consume: true };
       }
       return undefined;
@@ -205,7 +246,7 @@ export function registerObservationalMemory(
   ): void {
     settings = next;
     memory?.configure(next);
-    if (!next.enabled) stopMaintenance();
+    if (!next.enabled) stopMaintenance("disabled");
     else kickMaintenance(context);
     refreshStatus(context);
   }
@@ -220,7 +261,7 @@ export function registerObservationalMemory(
   }
 
   pi.on("session_start", (_event, context) => {
-    stopMaintenance();
+    stopMaintenance("session-replacement");
     removeTerminalInputListener?.();
     removeTerminalInputListener = undefined;
     memory?.dispose();
@@ -240,7 +281,7 @@ export function registerObservationalMemory(
 
   pi.on("session_tree", (_event, context) => {
     if (!memory) return;
-    stopMaintenance();
+    stopMaintenance("navigation");
     currentContext = context;
     memory.restore(snapshot(context));
     kickMaintenance(context);
@@ -303,7 +344,7 @@ export function registerObservationalMemory(
   });
 
   pi.on("session_shutdown", () => {
-    stopMaintenance();
+    stopMaintenance("shutdown");
     removeTerminalInputListener?.();
     removeTerminalInputListener = undefined;
     memory?.dispose();

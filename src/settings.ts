@@ -9,6 +9,8 @@ import {
 
 export interface ObservationalMemorySettings {
   enabled: boolean;
+  /** Persist bounded lifecycle events and show matching TUI notifications. */
+  debugLogging: boolean;
   /** Uncovered exact-message target after an observational compaction. */
   messageTokensTarget: number;
   /** Start ambient observation when uncovered exact messages reach this size. */
@@ -25,6 +27,7 @@ export type SettingsScope = "global" | "project";
 
 export const DEFAULT_SETTINGS: ObservationalMemorySettings = {
   enabled: true,
+  debugLogging: false,
   messageTokensTarget: 20_000,
   messageTokensStartObservation: 40_000,
   observationTokensTarget: 20_000,
@@ -56,11 +59,12 @@ function parsePartial(value: unknown): Partial<ObservationalMemorySettings> {
   }
   const source = value as Record<string, unknown>;
   const parsed: Partial<ObservationalMemorySettings> = {};
-  if (source.enabled !== undefined) {
-    if (typeof source.enabled !== "boolean") {
-      throw new Error("enabled must be true or false");
+  for (const key of ["enabled", "debugLogging"] as const) {
+    if (source[key] === undefined) continue;
+    if (typeof source[key] !== "boolean") {
+      throw new Error(`${key} must be true or false`);
     }
-    parsed.enabled = source.enabled;
+    parsed[key] = source[key];
   }
   for (const key of TOKEN_KEYS) {
     const candidate = source[key];
