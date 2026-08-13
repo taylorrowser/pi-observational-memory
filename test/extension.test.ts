@@ -171,6 +171,40 @@ describe("observational-memory extension", () => {
     );
   });
 
+  it("persists settled no-op maintenance events without notifying the user", async () => {
+    const { pi, handlers, appendEntry } = extensionApi();
+    const ctx = context([]);
+    let host: SessionMemoryHost | undefined;
+    registerObservationalMemory(pi, (createdHost) => {
+      host = createdHost;
+      return memorySpies();
+    });
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      ctx,
+    );
+    const event: MemoryDebugEvent = {
+      protocol: "observational-memory.event",
+      version: 1,
+      event: "maintenance-completed",
+      operation: "maintenance",
+      reason: "settled",
+      sessionId: "session-1",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      metrics: {
+        messages: { tokens: 10_000, threshold: 40_000, target: 20_000 },
+        observations: { tokens: 3_000, threshold: 40_000, target: 20_000, count: 2 },
+        reflection: { tokens: 0, limit: 5_000 },
+      },
+      detail: "0 observations, 0 reflections",
+    };
+
+    host?.debugEvent?.(event);
+
+    expect(appendEntry).toHaveBeenCalledWith("observational-memory:event", event);
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  });
+
   it("integrates observation and reflection activity into the metrics status", async () => {
     const { pi, handlers } = extensionApi();
     const ctx = context([]);

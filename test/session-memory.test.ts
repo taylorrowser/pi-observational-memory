@@ -522,6 +522,103 @@ describe("SessionMemory", () => {
     );
   });
 
+  it("replays observations separated by observational-memory debug events", () => {
+    const firstUser = { role: "user" as const, content: "First request", timestamp: 1 };
+    const firstAssistant = {
+      role: "assistant" as const,
+      content: [{ type: "text" as const, text: "First completed step" }],
+      api: "anthropic-messages" as const,
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      usage: zeroUsage,
+      stopReason: "stop" as const,
+      timestamp: 2,
+    };
+    const secondUser = { role: "user" as const, content: "Second request", timestamp: 3 };
+    const secondAssistant = {
+      ...firstAssistant,
+      content: [{ type: "text" as const, text: "Second completed step" }],
+      timestamp: 4,
+    };
+    const observation = (
+      ordinal: number,
+      parentCommitId: string | null,
+      entryIds: string[],
+    ) => ({
+      protocol: "observational-memory.observation",
+      version: 1,
+      id: `session-1:observation:${ordinal}`,
+      replayEpoch: "session-1",
+      parentCommitId,
+      coverage: {
+        entryIds,
+        startEntryId: entryIds[0],
+        endEntryId: entryIds.at(-1),
+      },
+      observations: [`Completed observation ${ordinal}.`],
+      activeTask: {
+        originalIntent: "Complete both requests.",
+        constraints: [],
+        decisions: [],
+        verifiedProgress: [],
+        currentWork: [],
+        blockers: [],
+        unresolvedQuestions: [],
+        nextMove: { owner: "assistant", action: "Continue." },
+      },
+      lineage: { parentCommitId },
+      producer: { provider: "anthropic", model: "claude-sonnet-4-5" },
+      usage: zeroUsage,
+      timestamp: `2026-01-01T00:00:0${ordinal + 2}.000Z`,
+      fidelity: "normal",
+      promptVersion: 1,
+      outputEstimate: 10,
+      validation: { version: 1, checks: ["contiguous-coverage"] },
+    });
+    const ancestry: SessionEntry[] = [
+      messageEntry("entry-1", null, firstUser),
+      messageEntry("entry-2", "entry-1", firstAssistant),
+      {
+        type: "custom",
+        id: "entry-3",
+        parentId: "entry-2",
+        timestamp: "2026-01-01T00:00:03.000Z",
+        customType: "observational-memory:observation",
+        data: observation(1, null, ["entry-1", "entry-2"]),
+      },
+      {
+        type: "custom",
+        id: "entry-4",
+        parentId: "entry-3",
+        timestamp: "2026-01-01T00:00:04.000Z",
+        customType: "observational-memory:event",
+        data: { event: "observation-activated" },
+      },
+      messageEntry("entry-5", "entry-4", secondUser),
+      messageEntry("entry-6", "entry-5", secondAssistant),
+      {
+        type: "custom",
+        id: "entry-7",
+        parentId: "entry-6",
+        timestamp: "2026-01-01T00:00:07.000Z",
+        customType: "observational-memory:observation",
+        data: observation(2, "session-1:observation:1", ["entry-5", "entry-6"]),
+      },
+    ];
+    const restoredSnapshot = { sessionId: "session-1", ancestry };
+    const memory = createSessionMemory({
+      appendEntry: vi.fn(),
+      attributeUsage: vi.fn(),
+      estimateTokens: () => 100,
+      completeObservation: vi.fn(() => new Promise<never>(() => {})),
+    });
+
+    memory.restore(restoredSnapshot);
+
+    expect(memory.inspect(restoredSnapshot).metrics.observations.count).toBe(2);
+    expect(memory.inspect(restoredSnapshot).metrics.messages.tokens).toBe(0);
+  });
+
   it("projects covered Pi-derived messages without duplication", async () => {
     const user = { role: "user" as const, content: "Original intent", timestamp: 1 };
     const derived = {

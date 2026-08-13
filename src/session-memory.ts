@@ -1349,12 +1349,7 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
       continue;
     }
 
-    if (
-      (entry.type === "custom" && entry.customType === USAGE_CUSTOM_TYPE) ||
-      (entry as { readonly type: string }).type === "extension_usage"
-    ) {
-      continue;
-    }
+    if (isMemoryEntry(entry)) continue;
 
     seenSource.push(entry);
   }

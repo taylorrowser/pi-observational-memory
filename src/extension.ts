@@ -146,7 +146,13 @@ export function registerObservationalMemory(
     ...piHost,
     debugEvent(event) {
       pi.appendEntry(DEBUG_EVENT_CUSTOM_TYPE, event);
-      currentContext?.ui.notify(formatMemoryDebugEvent(event), "info");
+      const isSettledNoop =
+        event.event === "maintenance-completed" &&
+        event.reason === "settled" &&
+        event.detail === "0 observations, 0 reflections";
+      if (!isSettledNoop) {
+        currentContext?.ui.notify(formatMemoryDebugEvent(event), "info");
+      }
     },
     setStatus(next) {
       activity = next;

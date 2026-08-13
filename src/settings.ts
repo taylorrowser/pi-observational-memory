@@ -9,7 +9,7 @@ import {
 
 export interface ObservationalMemorySettings {
   enabled: boolean;
-  /** Persist bounded lifecycle events and show matching TUI notifications. */
+  /** Persist bounded lifecycle events and notify for actionable lifecycle activity. */
   debugLogging: boolean;
   /** Uncovered exact-message target after an observational compaction. */
   messageTokensTarget: number;
