@@ -339,7 +339,7 @@ describe("hard headroom", () => {
     expect(appendEntry).not.toHaveBeenCalled();
     expect(abortActor).toHaveBeenCalledOnce();
     expect(abortActor).toHaveBeenCalledWith(
-      "Observational memory could not restore safe headroom; exact source was preserved.",
+      "Observational memory could not restore safe headroom; exact source was preserved. Attempts failed: 1) invalid response (empty output); 2) invalid response (empty output).",
     );
     expect(setStatus).toHaveBeenLastCalledWith(
       "memory stopped — source preserved",
@@ -347,6 +347,55 @@ describe("hard headroom", () => {
 
     expect(await memory.project(snapshot, messages)).toBe(messages);
     expect(abortActor).toHaveBeenNthCalledWith(2);
+  });
+
+  it("reports both classified hard-paused attempt failures without advancing source coverage", async () => {
+    const { messages, ancestry } = sourceFixture();
+    const first = deferred<ObservationResponse>();
+    const completeObservation = vi
+      .fn<
+        (
+          request: ObservationRequest,
+          signal?: AbortSignal,
+        ) => Promise<ObservationResponse>
+      >()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(async (request) => ({
+        ...validResponse(request),
+        stopReason: "length",
+      }));
+    const appendEntry = vi.fn();
+    const abortActor = vi.fn();
+    const memory = createSessionMemory({
+      appendEntry,
+      attributeUsage: vi.fn(),
+      estimateTokens: (estimatedMessages) => estimatedMessages.length * 250,
+      completeObservation,
+      setStatus: vi.fn(),
+      abortActor,
+    });
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry,
+      actor,
+      inputTokens: 900,
+      fixedInputTokens: 0,
+    };
+
+    memory.observe(snapshot);
+    const projection = memory.project(snapshot, messages);
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+    first.reject(new Error("observer transport unavailable"));
+
+    expect(await projection).toBe(messages);
+    expect(completeObservation).toHaveBeenCalledTimes(2);
+    expect(completeObservation.mock.calls[1]?.[0]).toBe(
+      completeObservation.mock.calls[0]?.[0],
+    );
+    expect(appendEntry).not.toHaveBeenCalled();
+    expect(abortActor).toHaveBeenCalledWith(
+      "Observational memory could not restore safe headroom; exact source was preserved. Attempts failed: 1) exception (Error: observer transport unavailable); 2) invalid response (stop reason: length).",
+    );
   });
 
   it("cancels hard-paused memory visibly and never activates a late response", async () => {

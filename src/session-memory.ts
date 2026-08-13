@@ -5,6 +5,8 @@ import {
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 
+import type { ObservationalMemorySettings } from "./settings.js";
+
 export interface ActorModel {
   readonly provider: string;
   readonly model: string;
@@ -21,9 +23,55 @@ export interface SessionSnapshot {
   readonly fixedInputTokens?: number;
 }
 
+export interface MemoryLayerMetric {
+  readonly tokens: number;
+  readonly limit: number;
+  readonly percent: number;
+}
+
+export interface MemoryInspection {
+  readonly observations: readonly {
+    readonly id: string;
+    readonly timestamp: string;
+    readonly observations: readonly string[];
+    readonly folded: boolean;
+  }[];
+  readonly reflection?: {
+    readonly id: string;
+    readonly reflectedHistory: readonly string[];
+  };
+  readonly metrics: {
+    readonly messages: MemoryLayerMetric;
+    readonly observations: MemoryLayerMetric & { readonly count: number };
+    readonly reflection: MemoryLayerMetric;
+  };
+  readonly usage: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead: number;
+    readonly cacheWrite: number;
+    readonly cost: number;
+  };
+}
+
+export interface MemoryCompactionResult {
+  readonly observationsCreated: number;
+  readonly reflectionsCreated: number;
+  readonly inspection: MemoryInspection;
+}
+
 export interface SessionMemory {
   restore(snapshot: SessionSnapshot): void;
+  configure(settings: ObservationalMemorySettings): void;
+  setEnabled(enabled: boolean): void;
   observe(snapshot: SessionSnapshot, signal?: AbortSignal): void;
+  compact(
+    snapshot: SessionSnapshot,
+    signal?: AbortSignal,
+  ): Promise<MemoryCompactionResult>;
+  inspect(snapshot: SessionSnapshot): MemoryInspection;
+  editObservation(id: string, observations: readonly string[]): void;
+  editReflection(reflectedHistory: readonly string[]): void;
   project(
     snapshot: SessionSnapshot,
     messages: ContextEvent["messages"],
@@ -214,13 +262,21 @@ const OBSERVATION_TARGET_RATIO = 0.15;
 const OBSERVATION_HIGH_RATIO = 0.25;
 const OBSERVATION_CUSTOM_TYPE = "observational-memory:observation";
 const REFLECTION_CUSTOM_TYPE = "observational-memory:reflection";
+const OBSERVATION_EDIT_CUSTOM_TYPE = "observational-memory:observation-edit";
+const REFLECTION_EDIT_CUSTOM_TYPE = "observational-memory:reflection-edit";
+const USAGE_CUSTOM_TYPE = "observational-memory:usage";
 
-function pressurePolicy(actor: ActorModel): ObservationRequest["pressure"] {
+function pressurePolicy(
+  actor: ActorModel,
+  settings?: ObservationalMemorySettings,
+): ObservationRequest["pressure"] {
   const usableInput = Math.max(1, actor.contextWindow - actor.maxTokens);
   return {
     usableInput,
-    rawTarget: Math.floor(usableInput * RAW_TARGET_RATIO),
-    soft: Math.floor(usableInput * SOFT_PRESSURE_RATIO),
+    rawTarget: settings?.messageTokensTarget ?? Math.floor(usableInput * RAW_TARGET_RATIO),
+    soft:
+      settings?.messageTokensStartObservation ??
+      Math.floor(usableInput * SOFT_PRESSURE_RATIO),
     hard: Math.floor(usableInput * HARD_PRESSURE_RATIO),
     safetyReserve:
       usableInput - Math.floor(usableInput * HARD_PRESSURE_RATIO),
@@ -228,17 +284,16 @@ function pressurePolicy(actor: ActorModel): ObservationRequest["pressure"] {
       actor.maxTokens,
       Math.max(1, Math.floor(usableInput * OBSERVATION_OUTPUT_RATIO)),
     ),
-    observationTarget: Math.max(
-      1,
-      Math.floor(usableInput * OBSERVATION_TARGET_RATIO),
-    ),
-    observationHigh: Math.max(
-      1,
-      Math.floor(usableInput * OBSERVATION_HIGH_RATIO),
-    ),
+    observationTarget:
+      settings?.observationTokensTarget ??
+      Math.max(1, Math.floor(usableInput * OBSERVATION_TARGET_RATIO)),
+    observationHigh:
+      settings?.observationTokensStartReflection ??
+      Math.max(1, Math.floor(usableInput * OBSERVATION_HIGH_RATIO)),
     reflectionOutputBudget: Math.min(
       actor.maxTokens,
-      Math.max(1, Math.floor(usableInput * OBSERVATION_OUTPUT_RATIO)),
+      settings?.reflectionTokensMax ??
+        Math.max(1, Math.floor(usableInput * OBSERVATION_OUTPUT_RATIO)),
     ),
   };
 }
@@ -259,9 +314,23 @@ function isReflectionEntry(
   return entry.type === "custom" && entry.customType === REFLECTION_CUSTOM_TYPE;
 }
 
+function isMemoryEntry(entry: SessionEntry): boolean {
+  if ((entry as { readonly type: string }).type === "extension_usage") {
+    return true;
+  }
+  return (
+    entry.type === "custom" &&
+    (entry.customType === OBSERVATION_CUSTOM_TYPE ||
+      entry.customType === REFLECTION_CUSTOM_TYPE ||
+      entry.customType === OBSERVATION_EDIT_CUSTOM_TYPE ||
+      entry.customType === REFLECTION_EDIT_CUSTOM_TYPE ||
+      entry.customType === USAGE_CUSTOM_TYPE)
+  );
+}
+
 function sourceEntries(ancestry: readonly SessionEntry[]): SessionEntry[] {
   return buildContextEntries([...ancestry]).filter(
-    (entry) => !isObservationEntry(entry) && !isReflectionEntry(entry),
+    (entry) => !isMemoryEntry(entry),
   );
 }
 
@@ -382,9 +451,10 @@ function frozenPrefix(
   snapshot: SessionSnapshot,
   coveredEntryIds: readonly string[],
   force = false,
+  settings?: ObservationalMemorySettings,
 ): SessionEntry[] | undefined {
   if (!snapshot.actor) return undefined;
-  const policy = pressurePolicy(snapshot.actor);
+  const policy = pressurePolicy(snapshot.actor, settings);
   const allSourceEntries = sourceEntries(snapshot.ancestry);
   const uncoveredTokens = uncoveredRawTokens(host, snapshot, coveredEntryIds);
   const inputTokens = force
@@ -468,12 +538,48 @@ function parseActiveTask(value: unknown): ActiveTaskAnchor | undefined {
   };
 }
 
+type ObservationRejection =
+  | {
+      readonly kind: "stop-reason";
+      readonly stopReason: ObservationResponse["stopReason"];
+    }
+  | { readonly kind: "empty-output" }
+  | {
+      readonly kind: "provider-mismatch";
+      readonly expected: string;
+      readonly received: string;
+    }
+  | {
+      readonly kind: "model-mismatch";
+      readonly expected: string;
+      readonly received: string;
+    }
+  | { readonly kind: "malformed-json" }
+  | { readonly kind: "invalid-envelope" }
+  | { readonly kind: "protocol-mismatch" }
+  | { readonly kind: "version-mismatch" }
+  | { readonly kind: "pass-mismatch" }
+  | { readonly kind: "parent-mismatch" }
+  | { readonly kind: "coverage-mismatch" }
+  | { readonly kind: "empty-observations" }
+  | { readonly kind: "incomplete-active-task" }
+  | {
+      readonly kind: "output-budget-exceeded";
+      readonly estimatedTokens: number;
+      readonly budgetTokens: number;
+    }
+  | { readonly kind: "empty-source" };
+
+type ObservationCandidateResult =
+  | { readonly kind: "accepted"; readonly record: ObservationCommit }
+  | { readonly kind: "rejected"; readonly rejection: ObservationRejection };
+
 function parseCandidate(
   host: SessionMemoryHost,
   request: ObservationRequest,
   response: ObservationResponse,
   expectedParentCommitId: string | null,
-): ObservationCommit | undefined {
+): ObservationCandidateResult {
   host.attributeUsage?.({
     usage: response.usage,
     provider: response.provider,
@@ -482,85 +588,139 @@ function parseCandidate(
     passId: request.passId,
   });
 
-  if (
-    response.stopReason !== "stop" ||
-    !response.text.trim() ||
-    response.provider !== request.actor.provider ||
-    response.model !== request.actor.model
-  ) {
-    return undefined;
+  if (response.stopReason !== "stop") {
+    return {
+      kind: "rejected",
+      rejection: { kind: "stop-reason", stopReason: response.stopReason },
+    };
+  }
+  if (!response.text.trim()) {
+    return { kind: "rejected", rejection: { kind: "empty-output" } };
+  }
+  if (response.provider !== request.actor.provider) {
+    return {
+      kind: "rejected",
+      rejection: {
+        kind: "provider-mismatch",
+        expected: request.actor.provider,
+        received: response.provider,
+      },
+    };
+  }
+  if (response.model !== request.actor.model) {
+    return {
+      kind: "rejected",
+      rejection: {
+        kind: "model-mismatch",
+        expected: request.actor.model,
+        received: response.model,
+      },
+    };
   }
 
   let candidate: unknown;
   try {
     candidate = JSON.parse(response.text);
   } catch {
-    return undefined;
+    return { kind: "rejected", rejection: { kind: "malformed-json" } };
   }
-  if (!isRecord(candidate) || !isRecord(candidate.coverage)) return undefined;
+  if (!isRecord(candidate) || !isRecord(candidate.coverage)) {
+    return { kind: "rejected", rejection: { kind: "invalid-envelope" } };
+  }
+  if (candidate.protocol !== "observational-memory.observation") {
+    return { kind: "rejected", rejection: { kind: "protocol-mismatch" } };
+  }
+  if (candidate.version !== 1) {
+    return { kind: "rejected", rejection: { kind: "version-mismatch" } };
+  }
+  if (candidate.passId !== request.passId) {
+    return { kind: "rejected", rejection: { kind: "pass-mismatch" } };
+  }
+  if (
+    request.passId === expectedParentCommitId ||
+    candidate.parentCommitId !== expectedParentCommitId
+  ) {
+    return { kind: "rejected", rejection: { kind: "parent-mismatch" } };
+  }
 
   const entryIds = candidate.coverage.entryIds;
-  const observations = candidate.observations;
-  const activeTask = parseActiveTask(candidate.activeTask);
   if (
-    candidate.protocol !== "observational-memory.observation" ||
-    candidate.version !== 1 ||
-    candidate.passId !== request.passId ||
-    request.passId === expectedParentCommitId ||
-    candidate.parentCommitId !== expectedParentCommitId ||
     !isStringArray(entryIds) ||
     entryIds.length !== request.source.entryIds.length ||
     !entryIds.every(
       (entryId, index) => entryId === request.source.entryIds[index],
-    ) ||
-    !isStringArray(observations) ||
-    observations.length === 0 ||
-    !activeTask
+    )
   ) {
-    return undefined;
+    return { kind: "rejected", rejection: { kind: "coverage-mismatch" } };
+  }
+
+  const observations = candidate.observations;
+  if (!isStringArray(observations) || observations.length === 0) {
+    return { kind: "rejected", rejection: { kind: "empty-observations" } };
+  }
+  const activeTask = parseActiveTask(candidate.activeTask);
+  if (!activeTask) {
+    return {
+      kind: "rejected",
+      rejection: { kind: "incomplete-active-task" },
+    };
   }
 
   const outputEstimate = host.estimateTokens([
     { role: "user", content: response.text, timestamp: 0 },
   ]);
-  if (outputEstimate > request.pressure.observationOutputBudget) return undefined;
+  if (outputEstimate > request.pressure.observationOutputBudget) {
+    return {
+      kind: "rejected",
+      rejection: {
+        kind: "output-budget-exceeded",
+        estimatedTokens: outputEstimate,
+        budgetTokens: request.pressure.observationOutputBudget,
+      },
+    };
+  }
 
   const firstEntry = request.source.entries[0];
   const lastEntry = request.source.entries.at(-1);
-  if (!firstEntry || !lastEntry) return undefined;
+  if (!firstEntry || !lastEntry) {
+    return { kind: "rejected", rejection: { kind: "empty-source" } };
+  }
 
   return {
-    protocol: "observational-memory.observation",
-    version: 1,
-    id: request.passId,
-    replayEpoch: request.passId.split(":observation:")[0] ?? request.passId,
-    parentCommitId: expectedParentCommitId,
-    coverage: {
-      entryIds: [...request.source.entryIds],
-      startEntryId: firstEntry.id,
-      endEntryId: lastEntry.id,
-    },
-    observations,
-    derivedOrientations: derivedOrientations(request.source.entries),
-    activeTask,
-    lineage: { parentCommitId: expectedParentCommitId },
-    producer: { provider: response.provider, model: response.model },
-    usage: response.usage,
-    timestamp: lastEntry.timestamp,
-    fidelity: "normal",
-    promptVersion: 1,
-    outputEstimate,
-    validation: {
+    kind: "accepted",
+    record: {
+      protocol: "observational-memory.observation",
       version: 1,
-      checks: [
-        "protocol",
-        "complete-response",
-        "output-budget",
-        "parent-lineage",
-        "contiguous-coverage",
-        "complete-active-task",
-        "derived-orientation-provenance",
-      ],
+      id: request.passId,
+      replayEpoch: request.passId.split(":observation:")[0] ?? request.passId,
+      parentCommitId: expectedParentCommitId,
+      coverage: {
+        entryIds: [...request.source.entryIds],
+        startEntryId: firstEntry.id,
+        endEntryId: lastEntry.id,
+      },
+      observations,
+      derivedOrientations: derivedOrientations(request.source.entries),
+      activeTask,
+      lineage: { parentCommitId: expectedParentCommitId },
+      producer: { provider: response.provider, model: response.model },
+      usage: response.usage,
+      timestamp: lastEntry.timestamp,
+      fidelity: "normal",
+      promptVersion: 1,
+      outputEstimate,
+      validation: {
+        version: 1,
+        checks: [
+          "protocol",
+          "complete-response",
+          "output-budget",
+          "parent-lineage",
+          "contiguous-coverage",
+          "complete-active-task",
+          "derived-orientation-provenance",
+        ],
+      },
     },
   };
 }
@@ -586,8 +746,9 @@ function reflectionPrefix(
   actor: ActorModel,
   commits: readonly ObservationCommit[],
   activeReflection: ReflectionGeneration | undefined,
+  settings?: ObservationalMemorySettings,
 ): ObservationCommit[] | undefined {
-  const policy = pressurePolicy(actor);
+  const policy = pressurePolicy(actor, settings);
   const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
   const activeObservations = commits.slice(foldedCount);
   if (observationLayerTokens(host, activeObservations) < policy.observationHigh) {
@@ -610,8 +771,9 @@ function safeProjectionCommits(
   actor: ActorModel,
   commits: readonly ObservationCommit[],
   activeReflection: ReflectionGeneration | undefined,
+  settings?: ObservationalMemorySettings,
 ): ObservationCommit[] {
-  const policy = pressurePolicy(actor);
+  const policy = pressurePolicy(actor, settings);
   const foldedCount = activeReflection?.foldedObservationIds.length ?? 0;
   let visibleCount = foldedCount;
 
@@ -1001,6 +1163,21 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
       continue;
     }
 
+    if (
+      entry.type === "custom" &&
+      entry.customType === OBSERVATION_EDIT_CUSTOM_TYPE
+    ) {
+      if (!isPhysicallyContiguous || !isRecord(entry.data)) continue;
+      const targetId = entry.data.targetId;
+      const observations = entry.data.observations;
+      if (typeof targetId !== "string" || !isStringArray(observations)) continue;
+      const targetIndex = commits.findIndex((commit) => commit.id === targetId);
+      const target = commits[targetIndex];
+      if (!target || observations.length === 0) continue;
+      commits[targetIndex] = { ...target, observations };
+      continue;
+    }
+
     if (isReflectionEntry(entry)) {
       reflectionEntryCount += 1;
       const data = entry.data;
@@ -1026,6 +1203,33 @@ function replayMemory(snapshot: SessionSnapshot): ReplayedMemory {
         expectedObservations,
       );
       if (candidate) reflections.push(candidate);
+      continue;
+    }
+
+    if (
+      entry.type === "custom" &&
+      entry.customType === REFLECTION_EDIT_CUSTOM_TYPE
+    ) {
+      if (!isPhysicallyContiguous || !isRecord(entry.data)) continue;
+      const targetId = entry.data.targetId;
+      const reflectedHistory = entry.data.reflectedHistory;
+      const target = reflections.at(-1);
+      if (
+        !target ||
+        target.id !== targetId ||
+        !isStringArray(reflectedHistory) ||
+        reflectedHistory.length === 0
+      ) {
+        continue;
+      }
+      reflections[reflections.length - 1] = { ...target, reflectedHistory };
+      continue;
+    }
+
+    if (
+      (entry.type === "custom" && entry.customType === USAGE_CUSTOM_TYPE) ||
+      (entry as { readonly type: string }).type === "extension_usage"
+    ) {
       continue;
     }
 
@@ -1101,8 +1305,20 @@ function renderMemory(
   };
 }
 
-export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
-  type PassOutcome = "ready" | "failed" | "cancelled";
+export function createSessionMemory(
+  host: SessionMemoryHost,
+  initialSettings?: ObservationalMemorySettings,
+): SessionMemory {
+  type ObservationFailure =
+    | { readonly kind: "exception"; readonly detail: string }
+    | {
+        readonly kind: "invalid-response";
+        readonly rejection: ObservationRejection;
+      };
+  type PassOutcome =
+    | { readonly kind: "ready" }
+    | { readonly kind: "failed"; readonly failure: ObservationFailure }
+    | { readonly kind: "cancelled" };
   interface FrozenObservation {
     readonly request: ObservationRequest;
     readonly sessionId: string;
@@ -1121,9 +1337,19 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
   let ready: ReadyObservation | undefined;
   let activeCommits: ObservationCommit[] = [];
   let activeReflections: ReflectionGeneration[] = [];
+  let usageRecords: ExtensionUsageAttribution[] = [];
+  const accountingHost: SessionMemoryHost = {
+    ...host,
+    attributeUsage(attribution) {
+      usageRecords.push(attribution);
+      host.attributeUsage?.(attribution);
+    },
+  };
   let lifecycleRevision = 0;
   let status: string | undefined;
   let terminal = false;
+  let settings = initialSettings;
+  let enabled = settings?.enabled ?? true;
 
   function setStatus(next: string | undefined): void {
     if (status === next) return;
@@ -1131,7 +1357,60 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
     host.setStatus?.(next);
   }
 
-  function stopActor(kind: "cancelled" | "exhausted"): void {
+  function describeRejection(rejection: ObservationRejection): string {
+    switch (rejection.kind) {
+      case "stop-reason":
+        return `stop reason: ${rejection.stopReason}`;
+      case "empty-output":
+        return "empty output";
+      case "provider-mismatch":
+        return `provider mismatch: expected ${rejection.expected}, received ${rejection.received}`;
+      case "model-mismatch":
+        return `model mismatch: expected ${rejection.expected}, received ${rejection.received}`;
+      case "malformed-json":
+        return "malformed JSON";
+      case "invalid-envelope":
+        return "invalid response envelope";
+      case "protocol-mismatch":
+        return "protocol mismatch";
+      case "version-mismatch":
+        return "version mismatch";
+      case "pass-mismatch":
+        return "pass mismatch";
+      case "parent-mismatch":
+        return "parent lineage mismatch";
+      case "coverage-mismatch":
+        return "coverage mismatch";
+      case "empty-observations":
+        return "empty observations";
+      case "incomplete-active-task":
+        return "incomplete active task";
+      case "output-budget-exceeded":
+        return `output budget exceeded: estimated ${rejection.estimatedTokens}, budget ${rejection.budgetTokens}`;
+      case "empty-source":
+        return "empty frozen source";
+    }
+  }
+
+  function describeException(error: unknown): string {
+    const raw =
+      error instanceof Error
+        ? `${error.name || "Error"}${error.message ? `: ${error.message}` : ""}`
+        : `non-Error rejection: ${String(error)}`;
+    const compact = raw.replace(/\s+/g, " ").trim();
+    return compact.length <= 160 ? compact : `${compact.slice(0, 157)}...`;
+  }
+
+  function describeFailure(failure: ObservationFailure): string {
+    return failure.kind === "exception"
+      ? `exception (${failure.detail})`
+      : `invalid response (${describeRejection(failure.rejection)})`;
+  }
+
+  function stopActor(
+    kind: "cancelled" | "exhausted",
+    failures: readonly ObservationFailure[] = [],
+  ): void {
     if (terminal) return;
     terminal = true;
     const cancelled = kind === "cancelled";
@@ -1140,10 +1419,16 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
         ? "memory cancelled — source preserved"
         : "memory stopped — source preserved",
     );
+    const failureDetails =
+      !cancelled && failures.length > 0
+        ? ` Attempts failed: ${failures
+            .map((failure, index) => `${index + 1}) ${describeFailure(failure)}`)
+            .join("; ")}.`
+        : "";
     host.abortActor?.(
       cancelled
         ? "Observational memory was cancelled; exact source was preserved."
-        : "Observational memory could not restore safe headroom; exact source was preserved.",
+        : `Observational memory could not restore safe headroom; exact source was preserved.${failureDetails}`,
     );
   }
 
@@ -1156,7 +1441,13 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
     force: boolean,
   ): FrozenObservation | undefined {
     if (!snapshot.actor) return undefined;
-    const prefix = frozenPrefix(host, snapshot, coveredEntryIds(), force);
+    const prefix = frozenPrefix(
+      host,
+      snapshot,
+      coveredEntryIds(),
+      force,
+      settings,
+    );
     if (!prefix) return undefined;
 
     passNumber += 1;
@@ -1173,7 +1464,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
         passId: `${replayEpoch(snapshot)}:observation:${passNumber}`,
         parentCommitId: expectedParentCommitId,
         actor: snapshot.actor,
-        pressure: pressurePolicy(snapshot.actor),
+        pressure: pressurePolicy(snapshot.actor, settings),
         ...(newestCommit
           ? {
               activeMemory: {
@@ -1223,10 +1514,10 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           controller.signal.aborted ||
           lifecycleRevision !== frozen.launchRevision
         ) {
-          return "cancelled";
+          return { kind: "cancelled" };
         }
-        const record = parseCandidate(
-          host,
+        const candidate = parseCandidate(
+          accountingHost,
           frozen.request,
           response,
           frozen.expectedParentCommitId,
@@ -1236,18 +1527,31 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           controller.signal.aborted ||
           lifecycleRevision !== frozen.launchRevision
         ) {
-          return "cancelled";
+          return { kind: "cancelled" };
         }
-        if (!record) return "failed";
+        if (candidate.kind === "rejected") {
+          return {
+            kind: "failed",
+            failure: {
+              kind: "invalid-response",
+              rejection: candidate.rejection,
+            },
+          };
+        }
         ready = {
           sessionId: frozen.sessionId,
           launchLeafId: frozen.launchLeafId,
           expectedParentCommitId: frozen.expectedParentCommitId,
-          record,
+          record: candidate.record,
         };
-        return "ready";
-      } catch {
-        return controller.signal.aborted ? "cancelled" : "failed";
+        return { kind: "ready" };
+      } catch (error) {
+        return controller.signal.aborted
+          ? { kind: "cancelled" }
+          : {
+              kind: "failed",
+              failure: { kind: "exception", detail: describeException(error) },
+            };
       } finally {
         signal?.removeEventListener("abort", abort);
         if (runningController === controller) {
@@ -1338,12 +1642,19 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
     const activeReflection = activeReflections.at(-1);
     const projectedCommits =
       snapshot.actor &&
-      reflectionPrefix(host, snapshot.actor, activeCommits, activeReflection)
+      reflectionPrefix(
+        host,
+        snapshot.actor,
+        activeCommits,
+        activeReflection,
+        settings,
+      )
         ? safeProjectionCommits(
             host,
             snapshot.actor,
             activeCommits,
             activeReflection,
+            settings,
           )
         : activeCommits;
     if (projectedCommits.length === 0) {
@@ -1369,7 +1680,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
     messages: ContextEvent["messages"],
   ): boolean {
     if (!snapshot.actor) return false;
-    const policy = pressurePolicy(snapshot.actor);
+    const policy = pressurePolicy(snapshot.actor, settings);
     const incomingTokens = host.estimateTokens(messages);
     const rawTokens = Math.max(incomingTokens, snapshot.inputTokens ?? 0);
     return (
@@ -1382,12 +1693,99 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
     );
   }
 
+  function inspection(snapshot: SessionSnapshot): MemoryInspection {
+    const policy = snapshot.actor
+      ? pressurePolicy(snapshot.actor, settings)
+      : {
+          rawTarget: settings?.messageTokensTarget ?? 20_000,
+          soft: settings?.messageTokensStartObservation ?? 40_000,
+          observationTarget: settings?.observationTokensTarget ?? 20_000,
+          observationHigh:
+            settings?.observationTokensStartReflection ?? 40_000,
+          reflectionOutputBudget: settings?.reflectionTokensMax ?? 5_000,
+        };
+    const messageTokens =
+      uncoveredRawTokens(host, snapshot, coveredEntryIds()) ??
+      host.estimateTokens(
+        sourceEntries(snapshot.ancestry).flatMap(entryMessages),
+      );
+    const activeReflection = activeReflections.at(-1);
+    const folded = new Set(activeReflection?.foldedObservationIds ?? []);
+    const observationTokens = host.estimateTokens([
+      {
+        role: "user",
+        content: JSON.stringify(
+          activeCommits
+            .filter((commit) => !folded.has(commit.id))
+            .map((commit) => commit.observations),
+        ),
+        timestamp: 0,
+      },
+    ]);
+    const reflectionTokens = activeReflection
+      ? host.estimateTokens([
+          {
+            role: "user",
+            content: JSON.stringify(activeReflection.reflectedHistory),
+            timestamp: 0,
+          },
+        ])
+      : 0;
+    const accountedUsage =
+      usageRecords.length > 0
+        ? usageRecords.map((record) => record.usage)
+        : [...activeCommits, ...activeReflections].map((record) => record.usage);
+    const usage = accountedUsage.reduce(
+      (totals, record) => ({
+        input: totals.input + record.input,
+        output: totals.output + record.output,
+        cacheRead: totals.cacheRead + record.cacheRead,
+        cacheWrite: totals.cacheWrite + record.cacheWrite,
+        cost: totals.cost + record.cost.total,
+      }),
+      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    );
+    const layer = (tokens: number, limit: number): MemoryLayerMetric => ({
+      tokens,
+      limit,
+      percent: limit > 0 ? (tokens / limit) * 100 : 0,
+    });
+    return {
+      observations: activeCommits.map((commit) => ({
+        id: commit.id,
+        timestamp: commit.timestamp,
+        observations: commit.observations,
+        folded: folded.has(commit.id),
+      })),
+      ...(activeReflection
+        ? {
+            reflection: {
+              id: activeReflection.id,
+              reflectedHistory: activeReflection.reflectedHistory,
+            },
+          }
+        : {}),
+      metrics: {
+        messages: layer(messageTokens, policy.soft),
+        observations: {
+          ...layer(observationTokens, policy.observationHigh),
+          count: activeCommits.length,
+        },
+        reflection: layer(
+          reflectionTokens,
+          policy.reflectionOutputBudget,
+        ),
+      },
+      usage,
+    };
+  }
+
   function isHardUnsafe(
     snapshot: SessionSnapshot,
     projectedMessages: ContextEvent["messages"],
   ): boolean {
     if (!snapshot.actor) return false;
-    const policy = pressurePolicy(snapshot.actor);
+    const policy = pressurePolicy(snapshot.actor, settings);
     const rawTokens = uncoveredRawTokens(host, snapshot, coveredEntryIds());
     if (rawTokens === undefined || rawTokens >= policy.hard) return true;
 
@@ -1406,7 +1804,13 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
   ): Promise<"accepted" | "failed" | "cancelled"> {
     const activeReflection = activeReflections.at(-1);
     const prefix = snapshot.actor
-      ? reflectionPrefix(host, snapshot.actor, activeCommits, activeReflection)
+      ? reflectionPrefix(
+          host,
+          snapshot.actor,
+          activeCommits,
+          activeReflection,
+          settings,
+        )
       : undefined;
     if (
       !prefix ||
@@ -1424,7 +1828,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
     const request: ReflectionRequest = {
       passId: `${replayEpoch(snapshot)}:reflection:${reflectionPassNumber}`,
       actor: snapshot.actor,
-      pressure: pressurePolicy(snapshot.actor),
+      pressure: pressurePolicy(snapshot.actor, settings),
       parentReflection: activeReflection
         ? {
             id: activeReflection.id,
@@ -1463,7 +1867,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           return "cancelled";
         }
         const record = parseReflectionCandidate(
-          host,
+          accountingHost,
           request,
           response,
           activeReflection,
@@ -1514,12 +1918,71 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
       const replayed = replayMemory(snapshot);
       activeCommits = replayed.commits;
       activeReflections = replayed.reflections;
+      usageRecords = snapshot.ancestry.flatMap((entry) => {
+        if (
+          entry.type === "custom" &&
+          entry.customType === USAGE_CUSTOM_TYPE &&
+          isRecord(entry.data) &&
+          isRecord(entry.data.usage) &&
+          typeof entry.data.provider === "string" &&
+          typeof entry.data.model === "string" &&
+          typeof entry.data.operation === "string"
+        ) {
+          return [entry.data as unknown as ExtensionUsageAttribution];
+        }
+        const extensionUsage = entry as unknown as {
+          readonly type: string;
+          readonly usage?: unknown;
+          readonly provider?: unknown;
+          readonly model?: unknown;
+          readonly operation?: unknown;
+          readonly passId?: unknown;
+        };
+        if (
+          extensionUsage.type === "extension_usage" &&
+          isRecord(extensionUsage.usage) &&
+          typeof extensionUsage.provider === "string" &&
+          typeof extensionUsage.model === "string" &&
+          typeof extensionUsage.operation === "string"
+        ) {
+          return [extensionUsage as unknown as ExtensionUsageAttribution];
+        }
+        return [];
+      });
       passNumber = replayed.observationEntryCount;
       reflectionPassNumber = replayed.reflectionEntryCount;
     },
 
+    configure(next) {
+      settings = next;
+      enabled = next.enabled;
+      if (!enabled) {
+        ready = undefined;
+        runningController?.abort("observational memory disabled");
+        setStatus(undefined);
+      }
+    },
+
+    setEnabled(next) {
+      enabled = next;
+      if (!enabled) {
+        ready = undefined;
+        runningController?.abort("observational memory disabled");
+        setStatus(undefined);
+      }
+    },
+
     observe(snapshot, signal) {
-      if (disposed || terminal || running || ready || signal?.aborted) return;
+      if (
+        !enabled ||
+        disposed ||
+        terminal ||
+        running ||
+        ready ||
+        signal?.aborted
+      ) {
+        return;
+      }
       if (
         snapshot.actor &&
         reflectionPrefix(
@@ -1527,6 +1990,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           snapshot.actor,
           activeCommits,
           activeReflections.at(-1),
+          settings,
         )
       ) {
         return;
@@ -1536,8 +2000,115 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
       void executeObservation(frozen, signal, false);
     },
 
+    async compact(snapshot, signal) {
+      if (!enabled) throw new Error("Observational memory is disabled");
+      if (!snapshot.actor) throw new Error("No actor model is selected");
+      if (disposed) throw new Error("Session memory is disposed");
+      let observationsCreated = 0;
+      let reflectionsCreated = 0;
+      setStatus("compacting memory");
+      try {
+        while (!signal?.aborted) {
+          if (
+            inspection(snapshot).metrics.messages.tokens <=
+            pressurePolicy(snapshot.actor, settings).rawTarget
+          ) {
+            break;
+          }
+          const frozen = freezeObservation(snapshot, true);
+          if (!frozen) break;
+          let outcome = await executeObservation(frozen, signal, true);
+          if (outcome.kind === "failed") {
+            outcome = await executeObservation(frozen, signal, true);
+          }
+          if (outcome.kind !== "ready") {
+            throw new Error(
+              outcome.kind === "cancelled"
+                ? "Observational compaction was cancelled"
+                : `Observational compaction failed: ${describeFailure(outcome.failure)}`,
+            );
+          }
+          const candidate = ready;
+          if (!candidate) throw new Error("Observer produced no ready memory");
+          host.appendEntry(OBSERVATION_CUSTOM_TYPE, candidate.record);
+          activeCommits.push(candidate.record);
+          ready = undefined;
+          observationsCreated += 1;
+        }
+        while (
+          reflectionPrefix(
+            host,
+            snapshot.actor,
+            activeCommits,
+            activeReflections.at(-1),
+            settings,
+          )
+        ) {
+          const outcome = await reflect(snapshot, signal, true);
+          if (outcome !== "accepted") {
+            throw new Error(
+              outcome === "cancelled"
+                ? "Observational compaction was cancelled"
+                : "Observational reflection failed",
+            );
+          }
+          reflectionsCreated += 1;
+        }
+        return {
+          observationsCreated,
+          reflectionsCreated,
+          inspection: inspection(snapshot),
+        };
+      } finally {
+        if (!terminal) setStatus(undefined);
+      }
+    },
+
+    inspect(snapshot) {
+      return inspection(snapshot);
+    },
+
+    editObservation(id, observations) {
+      const commit = activeCommits.find((candidate) => candidate.id === id);
+      const replacement = observations.map((value) => value.trim()).filter(Boolean);
+      if (!commit) throw new Error(`Unknown observation ${id}`);
+      if (replacement.length === 0) throw new Error("An observation cannot be empty");
+      host.appendEntry(OBSERVATION_EDIT_CUSTOM_TYPE, {
+        protocol: "observational-memory.observation-edit",
+        version: 1,
+        targetId: id,
+        observations: replacement,
+        timestamp: new Date().toISOString(),
+      });
+      activeCommits = activeCommits.map((candidate) =>
+        candidate.id === id ? { ...candidate, observations: replacement } : candidate,
+      );
+    },
+
+    editReflection(reflectedHistory) {
+      const active = activeReflections.at(-1);
+      const replacement = reflectedHistory
+        .map((value) => value.trim())
+        .filter(Boolean);
+      if (!active) throw new Error("There is no active reflection");
+      if (replacement.length === 0) throw new Error("A reflection cannot be empty");
+      host.appendEntry(REFLECTION_EDIT_CUSTOM_TYPE, {
+        protocol: "observational-memory.reflection-edit",
+        version: 1,
+        targetId: active.id,
+        reflectedHistory: replacement,
+        timestamp: new Date().toISOString(),
+      });
+      activeReflections = activeReflections.map((candidate) =>
+        candidate.id === active.id
+          ? { ...candidate, reflectedHistory: replacement }
+          : candidate,
+      );
+    },
+
     async project(snapshot, messages, signal) {
       if (disposed) return messages;
+      if (!enabled) return projection(snapshot, messages).messages;
       if (terminal) {
         host.abortActor?.();
         return messages;
@@ -1569,6 +2140,7 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
             snapshot.actor,
             activeCommits,
             activeReflections.at(-1),
+            settings,
           );
 
         if (reflectionRequired) {
@@ -1603,8 +2175,8 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
           const firstOutcome = await inFlight;
           signal?.removeEventListener("abort", abortInFlight);
           if (disposed || lifecycleRevision !== projectRevision) return messages;
-          if (firstOutcome === "ready") continue;
-          if (firstOutcome === "cancelled") {
+          if (firstOutcome.kind === "ready") continue;
+          if (firstOutcome.kind === "cancelled") {
             stopActor("cancelled");
             return messages;
           }
@@ -1614,8 +2186,9 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
             true,
           );
           if (disposed || lifecycleRevision !== projectRevision) return messages;
-          if (retryOutcome === "ready") continue;
-          stopActor(retryOutcome === "cancelled" ? "cancelled" : "exhausted");
+          if (retryOutcome.kind === "ready") continue;
+          if (retryOutcome.kind === "cancelled") stopActor("cancelled");
+          else stopActor("exhausted", [firstOutcome.failure, retryOutcome.failure]);
           return messages;
         }
 
@@ -1626,15 +2199,16 @@ export function createSessionMemory(host: SessionMemoryHost): SessionMemory {
         }
         const firstOutcome = await executeObservation(frozen, signal, true);
         if (disposed || lifecycleRevision !== projectRevision) return messages;
-        if (firstOutcome === "ready") continue;
-        if (firstOutcome === "cancelled") {
+        if (firstOutcome.kind === "ready") continue;
+        if (firstOutcome.kind === "cancelled") {
           stopActor("cancelled");
           return messages;
         }
         const retryOutcome = await executeObservation(frozen, signal, true);
         if (disposed || lifecycleRevision !== projectRevision) return messages;
-        if (retryOutcome === "ready") continue;
-        stopActor(retryOutcome === "cancelled" ? "cancelled" : "exhausted");
+        if (retryOutcome.kind === "ready") continue;
+        if (retryOutcome.kind === "cancelled") stopActor("cancelled");
+        else stopActor("exhausted", [firstOutcome.failure, retryOutcome.failure]);
         return messages;
       }
       return messages;

@@ -7,6 +7,7 @@ import { completeSimple } from "@earendil-works/pi-ai/compat";
 
 import type {
   ObservationRequest,
+  ExtensionUsageAttribution,
   ReflectionRequest,
   SessionMemoryHost,
 } from "./session-memory.js";
@@ -122,6 +123,16 @@ export function createPiHost(
         (total, message) => total + estimateTokens(message),
         0,
       );
+    },
+    attributeUsage(attribution) {
+      const usageApi = pi as ExtensionAPI & {
+        appendUsage?: (value: ExtensionUsageAttribution) => void;
+      };
+      if (typeof usageApi.appendUsage === "function") {
+        usageApi.appendUsage(attribution);
+      } else {
+        pi.appendEntry("observational-memory:usage", attribution);
+      }
     },
     completeObservation(request, signal) {
       return completeMemory(

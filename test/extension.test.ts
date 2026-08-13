@@ -23,6 +23,7 @@ function extensionApi() {
     on(event: string, handler: Handler) {
       handlers.set(event, handler);
     },
+    registerCommand: vi.fn(),
     appendEntry,
     getActiveTools,
     getAllTools,
@@ -37,8 +38,17 @@ function context(
   sessionId = "session-1",
 ) {
   return {
+    cwd: "/tmp/observational-memory-test",
     signal,
     getContextUsage: () => undefined,
+    isProjectTrusted: () => false,
+    ui: {
+      setStatus: vi.fn(),
+      notify: vi.fn(),
+      confirm: vi.fn(),
+      select: vi.fn(),
+      editor: vi.fn(),
+    },
     sessionManager: {
       getSessionId: () => sessionId,
       getBranch: () => ancestry,
@@ -49,7 +59,33 @@ function context(
 function memorySpies(): SessionMemory {
   return {
     restore: vi.fn(),
+    configure: vi.fn(),
+    setEnabled: vi.fn(),
     observe: vi.fn(),
+    compact: vi.fn(async () => ({
+      observationsCreated: 0,
+      reflectionsCreated: 0,
+      inspection: {
+        observations: [],
+        metrics: {
+          messages: { tokens: 0, limit: 1, percent: 0 },
+          observations: { tokens: 0, limit: 1, percent: 0, count: 0 },
+          reflection: { tokens: 0, limit: 1, percent: 0 },
+        },
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+      },
+    })),
+    inspect: vi.fn(() => ({
+      observations: [],
+      metrics: {
+        messages: { tokens: 0, limit: 1, percent: 0 },
+        observations: { tokens: 0, limit: 1, percent: 0, count: 0 },
+        reflection: { tokens: 0, limit: 1, percent: 0 },
+      },
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    })),
+    editObservation: vi.fn(),
+    editReflection: vi.fn(),
     project: vi.fn(async (_snapshot, messages) => messages),
     dispose: vi.fn(),
   };
@@ -192,6 +228,9 @@ describe("observational-memory extension", () => {
     const memory = memorySpies();
     const createMemory = vi.fn(() => memory);
     const ctx = {
+      cwd: "/tmp/observational-memory-test",
+      isProjectTrusted: () => false,
+      ui: { setStatus: vi.fn() },
       signal: undefined,
       model: {
         provider: "anthropic",
@@ -257,6 +296,9 @@ describe("observational-memory extension", () => {
     ] as never[]);
     const memory = memorySpies();
     const ctx = {
+      cwd: "/tmp/observational-memory-test",
+      isProjectTrusted: () => false,
+      ui: { setStatus: vi.fn() },
       signal: undefined,
       model: {
         provider: "anthropic",
@@ -453,7 +495,8 @@ describe("observational-memory extension", () => {
 
     expect(thresholdResult).toEqual({ cancel: true });
     expect(overflowResult).toBeUndefined();
-    expect(manualResult).toBeUndefined();
+    expect(manualResult).toEqual({ cancel: true });
+    expect(memory.compact).toHaveBeenCalledOnce();
     expect(memory.restore).toHaveBeenNthCalledWith(1, {
       sessionId: "session-1",
       ancestry: beforeAncestry,
@@ -467,6 +510,10 @@ describe("observational-memory extension", () => {
       ancestry: beforeAncestry,
     });
     expect(memory.restore).toHaveBeenNthCalledWith(4, {
+      sessionId: "session-1",
+      ancestry: beforeAncestry,
+    });
+    expect(memory.restore).toHaveBeenNthCalledWith(5, {
       sessionId: "session-1",
       ancestry: afterAncestry,
     });
@@ -509,7 +556,10 @@ describe("observational-memory extension", () => {
       "observational-memory",
       "disposing old runtime",
     );
-    expect(newSetStatus).not.toHaveBeenCalled();
+    expect(newSetStatus).toHaveBeenCalledWith(
+      "observational-memory-metrics",
+      expect.stringContaining("msg"),
+    );
     expect(second.restore).toHaveBeenCalledOnce();
   });
 });

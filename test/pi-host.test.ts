@@ -256,11 +256,31 @@ describe("Pi SessionMemory host", () => {
     expect(abort).toHaveBeenCalledTimes(2);
   });
 
-  it("does not require a private Pi usage API", () => {
-    const pi = {} as ExtensionAPI;
+  it("persists standalone usage through a public compatibility fallback", () => {
+    const appendEntry = vi.fn();
+    const pi = { appendEntry } as unknown as ExtensionAPI;
     const host = createPiHost(pi);
+    const attribution = {
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      operation: "observational-memory:observation" as const,
+      passId: "pass-1",
+    };
 
-    expect(host.attributeUsage).toBeUndefined();
+    host.attributeUsage?.(attribution);
+
     expect("appendUsage" in pi).toBe(false);
+    expect(appendEntry).toHaveBeenCalledWith(
+      "observational-memory:usage",
+      attribution,
+    );
   });
 });
