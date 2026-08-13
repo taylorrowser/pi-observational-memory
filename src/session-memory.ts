@@ -1500,7 +1500,12 @@ export function createSessionMemory(
   ): Promise<PassOutcome> {
     running = true;
     runningObservation = frozen;
-    if (!hardPaused) setStatus("observing");
+    const previousStatus = status;
+    setStatus(
+      previousStatus === "waiting for memory"
+        ? "observing — waiting for memory"
+        : "observing",
+    );
     const controller = new AbortController();
     runningController = controller;
     const abort = () => controller.abort(signal?.reason);
@@ -1563,7 +1568,9 @@ export function createSessionMemory(
           running = false;
           runningPromise = undefined;
           runningObservation = undefined;
-          if (status === "observing") setStatus(undefined);
+          if (status === "observing" || status === "observing — waiting for memory") {
+            setStatus(previousStatus);
+          }
         }
       }
     })();
@@ -1852,7 +1859,12 @@ export function createSessionMemory(
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       running = true;
-      if (!hardPaused) setStatus("observing");
+      const previousStatus = status;
+      setStatus(
+        previousStatus === "waiting for memory"
+          ? "reflecting — waiting for memory"
+          : "reflecting",
+      );
       const controller = new AbortController();
       runningController = controller;
       const abort = () => controller.abort(signal?.reason);
@@ -1900,7 +1912,12 @@ export function createSessionMemory(
         if (runningController === controller) {
           runningController = undefined;
           running = false;
-          if (status === "observing") setStatus(undefined);
+          if (
+            status === "reflecting" ||
+            status === "reflecting — waiting for memory"
+          ) {
+            setStatus(previousStatus);
+          }
         }
       }
     }

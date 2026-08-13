@@ -235,6 +235,7 @@ describe("SessionMemory reflection", () => {
         ]),
       );
     const appendEntry = vi.fn();
+    const setStatus = vi.fn();
     const memory = createSessionMemory({
       appendEntry,
       attributeUsage: vi.fn(),
@@ -243,7 +244,7 @@ describe("SessionMemory reflection", () => {
         throw new Error("unexpected observation");
       },
       completeReflection,
-      setStatus: vi.fn(),
+      setStatus,
       abortActor: vi.fn(),
     });
     memory.restore(snapshot);
@@ -251,6 +252,7 @@ describe("SessionMemory reflection", () => {
     const projected = await memory.project(snapshot, history.messages);
 
     expect(completeReflection).toHaveBeenCalledTimes(2);
+    expect(setStatus).toHaveBeenCalledWith("reflecting — waiting for memory");
     expect(completeReflection.mock.calls[1]?.[0]).toBe(
       completeReflection.mock.calls[0]?.[0],
     );

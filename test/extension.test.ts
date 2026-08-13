@@ -120,6 +120,37 @@ describe("observational-memory extension", () => {
     ).toBe("msg 54k (135%) • obs 8.5k (21%) • refl 0 (0%)");
   });
 
+  it("integrates observation and reflection activity into the metrics status", async () => {
+    const { pi, handlers } = extensionApi();
+    const ctx = context([]);
+    let host: SessionMemoryHost | undefined;
+    registerObservationalMemory(pi, (createdHost) => {
+      host = createdHost;
+      return memorySpies();
+    });
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      ctx,
+    );
+    const setStatus = vi.mocked(ctx.ui.setStatus);
+
+    host?.setStatus?.("observing");
+    expect(setStatus).toHaveBeenLastCalledWith(
+      "observational-memory-metrics",
+      "msg 0 (0%) • obs 0 (0%) • refl 0 (0%) • observing",
+    );
+
+    host?.setStatus?.("reflecting");
+    expect(setStatus).toHaveBeenLastCalledWith(
+      "observational-memory-metrics",
+      "msg 0 (0%) • obs 0 (0%) • refl 0 (0%) • reflecting",
+    );
+    expect(setStatus).not.toHaveBeenCalledWith(
+      "observational-memory",
+      expect.anything(),
+    );
+  });
+
   it("routes the selected session lifecycle through one SessionMemory", async () => {
     const { pi, handlers, appendEntry } = extensionApi();
     const memory = memorySpies();
@@ -581,12 +612,12 @@ describe("observational-memory extension", () => {
 
     expect(first?.dispose).toHaveBeenCalledOnce();
     expect(oldSetStatus).toHaveBeenCalledWith(
-      "observational-memory",
-      "disposing old runtime",
+      "observational-memory-metrics",
+      "msg 0 (0%) • obs 0 (0%) • refl 0 (0%) • disposing old runtime",
     );
     expect(newSetStatus).toHaveBeenCalledWith(
       "observational-memory-metrics",
-      expect.stringContaining("msg"),
+      "msg 0 (0%) • obs 0 (0%) • refl 0 (0%)",
     );
     expect(second.restore).toHaveBeenCalledOnce();
   });

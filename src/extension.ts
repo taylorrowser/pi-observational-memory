@@ -53,13 +53,17 @@ function formatTokens(tokens: number): string {
   return `${Math.round(tokens / 1_000)}k`;
 }
 
-export function formatMemoryStatus(inspection: MemoryInspection): string {
+export function formatMemoryStatus(
+  inspection: MemoryInspection,
+  activity?: string,
+): string {
   const metric = (label: string, layer: { tokens: number; percent: number }) =>
     `${label} ${formatTokens(layer.tokens)} (${Math.round(layer.percent)}%)`;
   return [
     metric("msg", inspection.metrics.messages),
     metric("obs", inspection.metrics.observations),
     metric("refl", inspection.metrics.reflection),
+    ...(activity ? [activity] : []),
   ].join(" • ");
 }
 
@@ -99,10 +103,18 @@ export function registerObservationalMemory(
   createMemory: SessionMemoryFactory = createSessionMemory,
 ): void {
   let currentContext: ExtensionContext | undefined;
-  const host = createPiHost(pi, () => currentContext);
+  const piHost = createPiHost(pi, () => currentContext);
   let memory: SessionMemory | undefined;
   let settings: ObservationalMemorySettings | undefined;
+  let activity: string | undefined;
   let allowNextStockCompaction = false;
+  const host: SessionMemoryHost = {
+    ...piHost,
+    setStatus(next) {
+      activity = next;
+      if (currentContext) refreshStatus(currentContext);
+    },
+  };
 
   function refreshStatus(context: ExtensionContext): void {
     if (!context.ui?.setStatus) return;
@@ -112,7 +124,7 @@ export function registerObservationalMemory(
     }
     context.ui.setStatus(
       "observational-memory-metrics",
-      formatMemoryStatus(memory.inspect(snapshot(context))),
+      formatMemoryStatus(memory.inspect(snapshot(context)), activity),
     );
   }
 
@@ -136,6 +148,7 @@ export function registerObservationalMemory(
 
   pi.on("session_start", (_event, context) => {
     memory?.dispose();
+    activity = undefined;
     currentContext = context;
     settings = loadSettings(context);
     memory =
