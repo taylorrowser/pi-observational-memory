@@ -364,15 +364,19 @@ function pressurePolicy(
   settings?: ObservationalMemorySettings,
 ): ObservationRequest["pressure"] {
   const usableInput = Math.max(1, actor.contextWindow - actor.maxTokens);
+  const hard = settings
+    ? Math.min(settings.hardHeadroomTokens, actor.contextWindow)
+    : Math.floor(usableInput * HARD_PRESSURE_RATIO);
   return {
     usableInput,
     rawTarget: settings?.messageTokensTarget ?? Math.floor(usableInput * RAW_TARGET_RATIO),
     soft:
       settings?.messageTokensStartObservation ??
       Math.floor(usableInput * SOFT_PRESSURE_RATIO),
-    hard: Math.floor(usableInput * HARD_PRESSURE_RATIO),
-    safetyReserve:
-      usableInput - Math.floor(usableInput * HARD_PRESSURE_RATIO),
+    hard,
+    safetyReserve: settings
+      ? Math.max(0, actor.contextWindow - hard)
+      : Math.max(0, usableInput - hard),
     observationOutputBudget: Math.min(
       actor.maxTokens,
       Math.max(1, Math.floor(usableInput * OBSERVATION_OUTPUT_RATIO)),
@@ -1553,6 +1557,23 @@ export function createSessionMemory(
     host.setStatus?.(next);
   }
 
+  function setWaitingStatus(): void {
+    setStatus(
+      runningObservation
+        ? "observing — waiting for memory"
+        : running
+          ? "reflecting — waiting for memory"
+          : "waiting for memory",
+    );
+  }
+
+  function clearWaitingStatus(): void {
+    if (!status?.includes("waiting for memory")) return;
+    setStatus(
+      runningObservation ? "observing" : running ? "reflecting" : undefined,
+    );
+  }
+
   function describeRejection(rejection: ObservationRejection): string {
     switch (rejection.kind) {
       case "stop-reason":
@@ -1976,22 +1997,26 @@ export function createSessionMemory(
     };
   }
 
+  function projectedInputTokens(
+    snapshot: SessionSnapshot,
+    incomingMessages: ContextEvent["messages"],
+    projectedMessages: ContextEvent["messages"],
+  ): number {
+    const incomingMessageTokens = host.estimateTokens(incomingMessages);
+    const nonMessageTokens = Math.max(
+      snapshot.fixedInputTokens ?? 0,
+      Math.max(0, (snapshot.inputTokens ?? 0) - incomingMessageTokens),
+    );
+    return nonMessageTokens + host.estimateTokens(projectedMessages);
+  }
+
   function isIncomingHardUnsafe(
     snapshot: SessionSnapshot,
     messages: ContextEvent["messages"],
   ): boolean {
     if (!snapshot.actor) return false;
     const policy = pressurePolicy(snapshot.actor, settings);
-    const incomingTokens = host.estimateTokens(messages);
-    const rawTokens = Math.max(incomingTokens, snapshot.inputTokens ?? 0);
-    return (
-      rawTokens >= policy.hard ||
-      (snapshot.fixedInputTokens ?? 0) +
-        incomingTokens +
-        snapshot.actor.maxTokens +
-        policy.safetyReserve >=
-        snapshot.actor.contextWindow
-    );
+    return projectedInputTokens(snapshot, messages, messages) >= policy.hard;
   }
 
   function inspection(snapshot: SessionSnapshot): MemoryInspection {
@@ -2083,18 +2108,14 @@ export function createSessionMemory(
 
   function isHardUnsafe(
     snapshot: SessionSnapshot,
+    incomingMessages: ContextEvent["messages"],
     projectedMessages: ContextEvent["messages"],
   ): boolean {
     if (!snapshot.actor) return false;
     const policy = pressurePolicy(snapshot.actor, settings);
-    const rawTokens = uncoveredRawTokens(host, snapshot, coveredEntryIds());
-    if (rawTokens === undefined || rawTokens >= policy.hard) return true;
-
-    const projectedInput =
-      (snapshot.fixedInputTokens ?? 0) + host.estimateTokens(projectedMessages);
     return (
-      projectedInput + snapshot.actor.maxTokens + policy.safetyReserve >=
-      snapshot.actor.contextWindow
+      projectedInputTokens(snapshot, incomingMessages, projectedMessages) >=
+      policy.hard
     );
   }
 
@@ -2598,7 +2619,7 @@ export function createSessionMemory(
           if (isIncomingHardUnsafe(snapshot, messages)) stopActor(snapshot, "exhausted");
           return messages;
         }
-        const hardUnsafe = isHardUnsafe(snapshot, projected);
+        const hardUnsafe = isHardUnsafe(snapshot, messages, projected);
         const reflectionRequired =
           snapshot.actor &&
           reflectionPrefix(
@@ -2611,7 +2632,7 @@ export function createSessionMemory(
 
         if (reflectionRequired) {
           if (hardUnsafe) {
-            setStatus("waiting for memory");
+            setWaitingStatus();
             emitDebugEvent(snapshot, {
               event: "hard-headroom-wait",
               operation: "hard-headroom",
@@ -2621,7 +2642,8 @@ export function createSessionMemory(
           if (running) {
             if (!hardUnsafe) return projected;
             if ((await waitForRunning(signal)) === "cancelled") {
-              stopActor(snapshot, "cancelled");
+              clearWaitingStatus();
+              host.abortActor?.();
               return messages;
             }
             if (disposed || lifecycleRevision !== projectRevision) return messages;
@@ -2637,11 +2659,11 @@ export function createSessionMemory(
         }
 
         if (!hardUnsafe) {
-          if (status === "waiting for memory") setStatus(undefined);
+          clearWaitingStatus();
           return projected;
         }
 
-        setStatus("waiting for memory");
+        setWaitingStatus();
         emitDebugEvent(snapshot, {
           event: "hard-headroom-wait",
           operation: "hard-headroom",
@@ -2665,7 +2687,8 @@ export function createSessionMemory(
           const firstOutcome = await Promise.race([inFlight, actorAborted]);
           removeAbortListener();
           if (firstOutcome === undefined) {
-            stopActor(snapshot, "cancelled");
+            clearWaitingStatus();
+            host.abortActor?.();
             return messages;
           }
           if (disposed || lifecycleRevision !== projectRevision) return messages;

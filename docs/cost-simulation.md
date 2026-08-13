@@ -18,6 +18,8 @@ For every seed, the simulator generates one model-independent token workload and
 - **Stock compaction:** preflight the next prompt and compact at 272,000 tokens, retaining 20,000 exact tokens and generating a summary. The model includes Pi's possible split-turn summary call.
 - **Observational memory:** observe incrementally when uncovered exact messages reach 40,000 tokens, contract that layer toward 20,000, and reflect when active observations reach 40,000 tokens, contracting them toward 20,000.
 
+> This report preserves the configuration used by the August 2026 experiment. The extension's current production defaults now start message observation at 80,000 tokens and apply a 200,000-token complete-input hard gate, so these results should not be read as a benchmark of the newer policy without rerunning the experiment.
+
 The stock strategy is a requested mathematical counterfactual. It intentionally does not subtract GPT 5.6 Sol's 128,000 maximum output allowance from the 272,000-token actor-input trigger.
 
 ## Empirical workload fit

@@ -265,6 +265,7 @@ describe("SessionMemory reflection", () => {
         ...DEFAULT_SETTINGS,
         debugLogging: true,
         messageTokensTarget: 100,
+        hardHeadroomTokens: 850,
         messageTokensStartObservation: 200,
         observationTokensTarget: 100,
         observationTokensStartReflection: 250,
@@ -322,6 +323,7 @@ describe("SessionMemory reflection", () => {
       },
     );
     const abortActor = vi.fn();
+    const setStatus = vi.fn();
     const memory = createSessionMemory({
       appendEntry: vi.fn(),
       attributeUsage: vi.fn(),
@@ -330,6 +332,7 @@ describe("SessionMemory reflection", () => {
         throw new Error("unexpected observation");
       },
       completeReflection,
+      setStatus,
       abortActor,
     });
     memory.restore(snapshot);
@@ -358,6 +361,7 @@ describe("SessionMemory reflection", () => {
     expect(abortActor).toHaveBeenCalledOnce();
     expect(sessionController.signal.aborted).toBe(false);
     expect(reflectionSignal?.aborted).toBe(false);
+    expect(setStatus).toHaveBeenLastCalledWith("reflecting");
 
     pending.resolve(
       reflectionCandidate([
@@ -366,6 +370,7 @@ describe("SessionMemory reflection", () => {
       ]),
     );
     await maintenance;
+    expect(setStatus).toHaveBeenLastCalledWith(undefined);
   });
 
   it("does not reflect below observation high pressure", async () => {

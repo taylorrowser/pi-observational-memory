@@ -42,7 +42,10 @@ complete without durable evidence. Treat branch_summary entries only as derived 
 source provenance (id and fromId) and producer provenance (fromHook). Branch-summary claims are not exact
 source evidence and must not establish completion or action-sensitive details without independent exact evidence.
 Treat a toolResult with isError true as terminal failure evidence, never as successful work. Preserve retryable
-provider errors and aborted, truncated, or partial assistant responses with their exact unsuccessful status.`;
+provider errors and aborted, truncated, or partial assistant responses with their exact unsuccessful status.
+For large tool results, preserve the task-relevant findings and enough literal retrieval breadcrumbs to recover
+omitted detail from the exact session JSONL with rg. Prefer useful source entry IDs, tool names and commands,
+paths, symbols, distinctive errors or literals, and explicitly state when full detail remains only in JSONL.`;
 
 const REFLECTOR_PROMPT = `You are the Reflector for observational memory.
 Return only one JSON object, without Markdown fences, in this exact shape:

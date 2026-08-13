@@ -100,7 +100,107 @@ const actor = {
 };
 
 describe("hard headroom", () => {
-  it("keeps a raw-hard projection pending, retries the identical frozen pass once, and resumes safely", async () => {
+  it("blocks only when the complete projected actor input reaches the configured limit", async () => {
+    const { messages, ancestry } = sourceFixture();
+    const pending = deferred<ObservationResponse>();
+    const completeObservation = vi.fn<
+      (request: ObservationRequest, signal?: AbortSignal) => Promise<ObservationResponse>
+    >(() => pending.promise);
+    const estimateTokens = (estimatedMessages: ContextEvent["messages"]): number => {
+      const onlyContent =
+        estimatedMessages.length === 1 &&
+        estimatedMessages[0]?.role === "user" &&
+        typeof estimatedMessages[0].content === "string"
+          ? estimatedMessages[0].content
+          : "";
+      return onlyContent.startsWith("{") || onlyContent.startsWith("[")
+        ? 50
+        : estimatedMessages.length * 45_000;
+    };
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        attributeUsage: vi.fn(),
+        estimateTokens,
+        completeObservation,
+        setStatus: vi.fn(),
+        abortActor: vi.fn(),
+      },
+      DEFAULT_SETTINGS,
+    );
+    const baseSnapshot = {
+      sessionId: "session-1",
+      ancestry,
+      actor: {
+        provider: "openai-codex",
+        model: "gpt-5.6-sol",
+        contextWindow: 272_000,
+        maxTokens: 128_000,
+      },
+      inputTokens: 180_000,
+    };
+
+    await expect(
+      memory.project(
+        { ...baseSnapshot, fixedInputTokens: 19_999 },
+        messages,
+      ),
+    ).resolves.toBe(messages);
+    expect(completeObservation).not.toHaveBeenCalled();
+
+    const projection = memory.project(
+      { ...baseSnapshot, fixedInputTokens: 20_000 },
+      messages,
+    );
+    let settled = false;
+    void projection.then(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+    expect(settled).toBe(false);
+
+    const request = completeObservation.mock.calls[0]?.[0];
+    if (!request) throw new Error("expected a hard-paused observation request");
+    pending.resolve(validResponse(request));
+    await expect(projection).resolves.not.toBe(messages);
+  });
+
+  it("clamps the configured hard limit to a smaller model context window", async () => {
+    const { messages, ancestry } = sourceFixture();
+    const completeObservation = vi.fn(async (request: ObservationRequest) => ({
+      ...validResponse(request),
+      text: "",
+    }));
+    const abortActor = vi.fn();
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        attributeUsage: vi.fn(),
+        estimateTokens: (estimatedMessages) => estimatedMessages.length * 45_000,
+        completeObservation,
+        abortActor,
+      },
+      DEFAULT_SETTINGS,
+    );
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry,
+      actor: {
+        provider: "anthropic",
+        model: "smaller-context-model",
+        contextWindow: 150_000,
+        maxTokens: 20_000,
+      },
+      inputTokens: 150_000,
+    };
+
+    await expect(memory.project(snapshot, messages)).resolves.toBe(messages);
+    expect(completeObservation).toHaveBeenCalledTimes(2);
+    expect(completeObservation.mock.calls[0]?.[0].pressure.hard).toBe(150_000);
+    expect(abortActor).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a hard projection pending, retries the identical frozen pass once, and resumes safely", async () => {
     const { messages, ancestry } = sourceFixture();
     const first = deferred<ObservationResponse>();
     const second = deferred<ObservationResponse>();
@@ -148,7 +248,7 @@ describe("hard headroom", () => {
 
     await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
     expect(settled).toBe(false);
-    expect(setStatus).toHaveBeenCalledWith("waiting for memory");
+    expect(setStatus).toHaveBeenCalledWith("observing — waiting for memory");
 
     first.reject(new Error("transient observer failure"));
     await vi.waitFor(() =>
@@ -190,13 +290,14 @@ describe("hard headroom", () => {
       },
     );
     const abortActor = vi.fn();
+    const setStatus = vi.fn();
     const memory = createSessionMemory({
       appendEntry: vi.fn(),
       attributeUsage: vi.fn(),
       estimateTokens: (estimatedMessages) =>
         estimatedMessages.length === 1 ? 50 : estimatedMessages.length * 100,
       completeObservation,
-      setStatus: vi.fn(),
+      setStatus,
       abortActor,
     });
     const snapshot = {
@@ -219,9 +320,11 @@ describe("hard headroom", () => {
     expect(abortActor).toHaveBeenCalledOnce();
     expect(sessionController.signal.aborted).toBe(false);
     expect(observationSignal?.aborted).toBe(false);
+    expect(setStatus).toHaveBeenLastCalledWith("observing");
 
     observation.resolve(validResponse(completeObservation.mock.calls[0]![0]));
     await maintenance;
+    expect(setStatus).toHaveBeenLastCalledWith(undefined);
   });
 
   it("blocks on complete projected-request headroom even when raw pressure is below hard", async () => {
@@ -379,6 +482,7 @@ describe("hard headroom", () => {
         ...DEFAULT_SETTINGS,
         debugLogging: true,
         messageTokensTarget: 200,
+        hardHeadroomTokens: 850,
         messageTokensStartObservation: 400,
         observationTokensTarget: 100,
         observationTokensStartReflection: 400,
@@ -469,7 +573,7 @@ describe("hard headroom", () => {
     );
   });
 
-  it("cancels hard-paused memory visibly and never activates a late response", async () => {
+  it("clears actor waiting without cancelling the session-owned observation", async () => {
     const { messages, ancestry } = sourceFixture();
     const pending = deferred<ObservationResponse>();
     const completeObservation = vi.fn(
@@ -509,8 +613,9 @@ describe("hard headroom", () => {
     expect(completeObservation).toHaveBeenCalledOnce();
     expect(appendEntry).not.toHaveBeenCalled();
     expect(abortActor).toHaveBeenCalledOnce();
-    expect(setStatus).toHaveBeenLastCalledWith(
-      "memory cancelled — source preserved",
-    );
+    expect(setStatus).toHaveBeenLastCalledWith("observing");
+
+    pending.resolve(validResponse(completeObservation.mock.calls[0]![0]));
+    await vi.waitFor(() => expect(setStatus).toHaveBeenLastCalledWith(undefined));
   });
 });

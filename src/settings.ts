@@ -15,6 +15,8 @@ export interface ObservationalMemorySettings {
   messageTokensTarget: number;
   /** Start ambient observation when uncovered exact messages reach this size. */
   messageTokensStartObservation: number;
+  /** Block an actor request when its complete projected input reaches this size. */
+  hardHeadroomTokens: number;
   /** Active-observation target after reflection. */
   observationTokensTarget: number;
   /** Start reflection when active observations reach this size. */
@@ -29,7 +31,8 @@ export const DEFAULT_SETTINGS: ObservationalMemorySettings = {
   enabled: true,
   debugLogging: false,
   messageTokensTarget: 20_000,
-  messageTokensStartObservation: 40_000,
+  messageTokensStartObservation: 80_000,
+  hardHeadroomTokens: 200_000,
   observationTokensTarget: 20_000,
   observationTokensStartReflection: 40_000,
   reflectionTokensMax: 5_000,
@@ -39,6 +42,7 @@ const SETTINGS_FILE = "observational-memory.json";
 const TOKEN_KEYS = [
   "messageTokensTarget",
   "messageTokensStartObservation",
+  "hardHeadroomTokens",
   "observationTokensTarget",
   "observationTokensStartReflection",
   "reflectionTokensMax",
