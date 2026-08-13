@@ -108,6 +108,10 @@ export function registerObservationalMemory(
   let settings: ObservationalMemorySettings | undefined;
   let activity: string | undefined;
   let allowNextStockCompaction = false;
+  let maintenanceController: AbortController | undefined;
+  let maintenanceTask: Promise<unknown> | undefined;
+  let maintenanceRequested = false;
+  let removeTerminalInputListener: (() => void) | undefined;
   const host: SessionMemoryHost = {
     ...piHost,
     setStatus(next) {
@@ -115,6 +119,73 @@ export function registerObservationalMemory(
       if (currentContext) refreshStatus(currentContext);
     },
   };
+
+  function stopMaintenance(): void {
+    maintenanceRequested = false;
+    maintenanceController?.abort();
+    maintenanceController = undefined;
+    maintenanceTask = undefined;
+  }
+
+  function kickMaintenance(context: ExtensionContext): void {
+    currentContext = context;
+    if (!memory || !settings?.enabled) return;
+    if (maintenanceTask) {
+      maintenanceRequested = true;
+      return;
+    }
+
+    maintenanceRequested = false;
+    const maintainedMemory = memory;
+    const controller = new AbortController();
+    maintenanceController = controller;
+    const task = maintainedMemory
+      .maintain(
+        () => snapshot(currentContext ?? context),
+        controller.signal,
+      )
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          context.ui.notify(
+            error instanceof Error ? error.message : String(error),
+            "error",
+          );
+        }
+      })
+      .finally(() => {
+        if (maintenanceTask !== task) return;
+        const shouldRestart = maintenanceRequested;
+        maintenanceRequested = false;
+        maintenanceController = undefined;
+        maintenanceTask = undefined;
+        if (currentContext) refreshStatus(currentContext);
+        if (
+          shouldRestart &&
+          currentContext &&
+          memory === maintainedMemory &&
+          settings?.enabled
+        ) {
+          kickMaintenance(currentContext);
+        }
+      });
+    maintenanceTask = task;
+  }
+
+  function bindTerminalInput(context: ExtensionContext): void {
+    removeTerminalInputListener?.();
+    removeTerminalInputListener = context.ui?.onTerminalInput?.((data) => {
+      if (
+        data === "\u001b" &&
+        context.isIdle() &&
+        maintenanceController &&
+        maintenanceTask
+      ) {
+        stopMaintenance();
+        return { consume: true };
+      }
+      return undefined;
+    });
+  }
 
   function refreshStatus(context: ExtensionContext): void {
     if (!context.ui?.setStatus) return;
@@ -134,6 +205,8 @@ export function registerObservationalMemory(
   ): void {
     settings = next;
     memory?.configure(next);
+    if (!next.enabled) stopMaintenance();
+    else kickMaintenance(context);
     refreshStatus(context);
   }
 
@@ -147,6 +220,9 @@ export function registerObservationalMemory(
   }
 
   pi.on("session_start", (_event, context) => {
+    stopMaintenance();
+    removeTerminalInputListener?.();
+    removeTerminalInputListener = undefined;
     memory?.dispose();
     activity = undefined;
     currentContext = context;
@@ -157,13 +233,17 @@ export function registerObservationalMemory(
         : createMemory(host);
     memory.restore(snapshot(context));
     memory.configure(settings);
+    bindTerminalInput(context);
     refreshStatus(context);
+    kickMaintenance(context);
   });
 
   pi.on("session_tree", (_event, context) => {
     if (!memory) return;
+    stopMaintenance();
     currentContext = context;
     memory.restore(snapshot(context));
+    kickMaintenance(context);
   });
 
   pi.on("session_before_compact", async (event, context) => {
@@ -201,8 +281,12 @@ export function registerObservationalMemory(
 
   pi.on("turn_end", (_event, context) => {
     currentContext = context;
-    memory?.observe(snapshot(context), context.signal);
+    kickMaintenance(context);
     if (memory && settings?.enabled) refreshStatus(context);
+  });
+
+  pi.on("agent_settled", (_event, context) => {
+    kickMaintenance(context);
   });
 
   pi.on("context", async (event, context) => {
@@ -219,6 +303,9 @@ export function registerObservationalMemory(
   });
 
   pi.on("session_shutdown", () => {
+    stopMaintenance();
+    removeTerminalInputListener?.();
+    removeTerminalInputListener = undefined;
     memory?.dispose();
     memory = undefined;
     settings = undefined;

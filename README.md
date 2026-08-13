@@ -2,9 +2,9 @@
 
 A Pi extension for session-scoped observational memory during long user turns.
 
-The extension watches completed model steps and remains inert below a built-in soft pressure watermark. Above it, the extension asynchronously observes the oldest complete source prefix with the current actor model, validates and persists the resulting memory, and activates it on the next safe context projection. When active observations reach their high watermark, the projection waits for one validated reflection generation that folds the oldest contiguous observations toward their target. Replay selects only the newest valid reflection, newer observations, the newest active-task anchor, and the exact uncovered source tail.
+The extension watches completed model steps. With the production defaults, it asynchronously observes the oldest complete source prefix once uncovered exact messages reach 40,000 tokens, contracting that layer toward 20,000 tokens. It activates validated memory during background maintenance or the next safe context projection. Once active observations reach 40,000 tokens, maintenance or projection folds the oldest contiguous observations toward a 20,000-token target through one validated reflection. Replay selects only the newest valid reflection, newer observations, the newest active-task anchor, and the exact uncovered source tail.
 
-The built-in policy derives every threshold from the actor model's usable input budget: raw target 50%, soft pressure 60%, hard pressure 85%, observation target 15%, and observation high pressure 25%. Observer and Reflector output budgets are capped at 10% of usable input or the model's maximum output, whichever is smaller. Before each actor request, the hard gate checks both the exact uncovered source and the complete projected request, including the effective system prompt, active tool schemas, actor output allowance, and the remaining 15% safety reserve.
+Those configured start thresholds and contraction targets override the lower-level model-relative fallback policy. Callers without settings derive raw target 50%, soft pressure 60%, observation target 15%, and observation high pressure 25% from the actor model's usable input budget. Hard safety is always model-relative: hard pressure is 85% of usable actor input, with the remaining 15% reserved. Observer output is capped at 10% of usable input or the model's maximum output; configured production reflection output is capped at 5,000 tokens per generation. Before each actor request, the hard gate checks both the exact uncovered source and the complete projected request, including the effective system prompt, active tool schemas, actor output allowance, and safety reserve.
 
 Normal observation shows a compact status only while work is running. At hard pressure, the next actor request visibly waits while serial memory work restores safe headroom. A failed or invalid frozen pass is retried exactly once; exhaustion or cancellation preserves exact source, aborts the actor run, and leaves an explicit terminal status rather than falling back to stock compaction. Exhaustion notifications classify both failed attempts without retaining full observer output.
 
@@ -43,7 +43,7 @@ pi --extension .
 
 ## Use and limitations
 
-Observational memory is ambient. Pi shows message, observation, and reflection token-layer metrics in one extension status line; progress may exceed 100% while a layer remains above its configured threshold. Reaching the message threshold starts an observation pass. The same line appends distinct `observing` or `reflecting` activity, along with `compacting memory` and hard-headroom waiting states when applicable. Pressing Escape cancels the actor and current memory work without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
+Observational memory is ambient. Pi shows message, observation, and reflection token-layer metrics in one extension status line; progress may exceed 100% while a layer remains above its configured threshold. Reaching the message threshold starts background maintenance. The same line appends distinct `observing` or `reflecting` activity, along with `compacting memory` and hard-headroom waiting states when applicable. While the actor is running, the first Escape remains Pi's actor interrupt and background memory continues. After Pi becomes idle, a later Escape stops active background memory without activating partial output. If the one hard-pause retry is exhausted, Pi stops visibly and preserves exact source.
 
 Commands:
 
@@ -67,7 +67,21 @@ Settings are stored in `~/.pi/agent/observational-memory.json` or the trusted pr
 }
 ```
 
-Targets must be positive integers; each target must be lower than its corresponding start threshold. Edits and usage records are append-only. Disabling memory immediately stops new work while retaining any already-active projected memory, so it cannot unsafely expand a large context; re-enabling reuses the validated replay epoch and catches up normally. Stock overflow compaction remains the emergency escape hatch. Derived memory remains fallible, exact source remains canonical, and the extension makes no universal cost, latency, or task-quality claim.
+### Memory lifecycle
+
+1. On startup or resume, after completed turns, and after the agent settles, a session-owned background coordinator checks the estimated tokens in uncovered exact messages. It starts when that message layer reaches the configured threshold; fixed system-prompt and tool-schema tokens do not trigger it early. It freezes the oldest uncovered prefix ending at a complete assistant response or completed tool-call set and asks the actor model to retire enough source toward the message target. The coordinator continues catch-up independently after the actor finishes or is interrupted.
+2. The observer result is validated and held as ready. It does not replace source immediately. The coordinator or a later context projection persists and activates it only if session lineage, source coverage, ancestry, and context composition still match unambiguously.
+3. Projection renders the active reflection, observations not already folded into it, the current task anchor, and the exact uncovered source tail.
+4. When active, unfolded observations reach the reflection threshold, the background coordinator or projection generates a reflection over the oldest contiguous observation prefix. Background maintenance safely activates each observation before reflecting and continues serially until no work is due. It folds enough whole observation commits to move toward the observation target. Manual `/compact` performs observations serially until the message layer reaches its target, then repeats reflection while warranted.
+5. Independently of those configurable thresholds, each actor projection passes a model-relative hard-headroom gate. At hard pressure, memory work becomes blocking, retries one failed frozen observation, and aborts fail-closed with exact source preserved if safe headroom cannot be restored.
+
+Targets must be positive integers; each target must be lower than its corresponding start threshold. The 40k values start work and the 20k values guide contraction; none is a hard retained-layer cap. Observations retire whole completed model/tool steps and reflections fold whole observation commits, so boundaries can overshoot a target. A layer can also remain above its start threshold while work runs, awaits safe activation, or has no complete boundary available. `reflectionTokensMax` limits one generated reflection response, not the total lifetime of the reflection layer.
+
+Edits and usage records are append-only. Disabling memory immediately stops new work while retaining any already-active projected memory, so it cannot unsafely expand a large context; re-enabling reuses the validated replay epoch and catches up normally. Stock overflow compaction remains the emergency escape hatch. Derived memory remains fallible, exact source remains canonical, and the extension makes no universal cost, latency, or task-quality claim.
+
+## Cost simulation
+
+[`docs/cost-simulation.md`](docs/cost-simulation.md) records the reproducible GPT 5.6 Sol Monte Carlo comparison with stock Pi compaction. It covers the corrected 272k stock-compaction counterfactual, empirical workload fitting, provider pricing, actor prompt-cache invalidation, perfect/warm/no-cache sensitivities, results, and limitations.
 
 ## Acceptance evidence
 

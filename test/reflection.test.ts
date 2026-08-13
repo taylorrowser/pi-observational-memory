@@ -12,6 +12,16 @@ const zeroUsage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 const actor = {
   provider: "anthropic",
   model: "claude-sonnet-4-5",
@@ -261,6 +271,78 @@ describe("SessionMemory reflection", () => {
       expect.objectContaining({ id: "session-1:reflection:1" }),
     );
     expect(projectedMemoryContent(projected)).toContain("HISTORY:");
+  });
+
+  it("does not fail hard projection while session-owned reflection is running", async () => {
+    const history = observedHistory(3);
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry: history.ancestry,
+      actor,
+      inputTokens: 400,
+      fixedInputTokens: 700,
+    };
+    const pending = deferred<ReturnType<typeof reflectionCandidate>>();
+    let reflectionSignal: AbortSignal | undefined;
+    const completeReflection = vi.fn(
+      (
+        _request: unknown,
+        signal?: AbortSignal,
+      ): Promise<ReturnType<typeof reflectionCandidate>> => {
+        reflectionSignal = signal;
+        return new Promise((resolve, reject) => {
+          pending.promise.then(resolve, reject);
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      },
+    );
+    const abortActor = vi.fn();
+    const memory = createSessionMemory({
+      appendEntry: vi.fn(),
+      attributeUsage: vi.fn(),
+      estimateTokens: observationTokenEstimate,
+      async completeObservation() {
+        throw new Error("unexpected observation");
+      },
+      completeReflection,
+      abortActor,
+    });
+    memory.restore(snapshot);
+
+    const sessionController = new AbortController();
+    const maintenance = memory.maintain(() => snapshot, sessionController.signal);
+    await vi.waitFor(() => expect(completeReflection).toHaveBeenCalledOnce());
+
+    const actorController = new AbortController();
+    const projection = memory.project(
+      snapshot,
+      history.messages,
+      actorController.signal,
+    );
+    let settled = false;
+    void projection.then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    expect(abortActor).not.toHaveBeenCalled();
+
+    actorController.abort("actor stopped");
+    await projection;
+
+    expect(abortActor).toHaveBeenCalledOnce();
+    expect(sessionController.signal.aborted).toBe(false);
+    expect(reflectionSignal?.aborted).toBe(false);
+
+    pending.resolve(
+      reflectionCandidate([
+        "session-1:observation:1",
+        "session-1:observation:2",
+      ]),
+    );
+    await maintenance;
   });
 
   it("does not reflect below observation high pressure", async () => {

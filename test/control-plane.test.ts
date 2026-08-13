@@ -115,6 +115,40 @@ describe("SessionMemory control plane", () => {
     );
   });
 
+  it("does not start ambient observation before uncovered messages reach their threshold", () => {
+    const source = history(1);
+    const completeObservation = vi.fn(async (request) => candidate(request));
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        estimateTokens(messages) {
+          return messages.length * 100;
+        },
+        completeObservation,
+      },
+      {
+        ...DEFAULT_SETTINGS,
+        messageTokensTarget: 200,
+        messageTokensStartObservation: 400,
+        observationTokensStartReflection: 10_000,
+      },
+    );
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry: source.ancestry,
+      actor,
+      // Fixed prompts and tool schemas can put the complete actor request over
+      // the configured message threshold while uncovered messages remain below it.
+      inputTokens: 600,
+    };
+    memory.restore(snapshot);
+    expect(memory.inspect(snapshot).metrics.messages.tokens).toBe(200);
+
+    memory.observe(snapshot);
+
+    expect(completeObservation).not.toHaveBeenCalled();
+  });
+
   it("starts another ambient observation when the uncovered message layer reaches its threshold", async () => {
     const initial = history(3);
     const expanded = history(4);
@@ -157,6 +191,61 @@ describe("SessionMemory control plane", () => {
     memory.observe(expandedSnapshot);
 
     await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledTimes(2));
+  });
+
+  it("serially catches up observations and then reflects in background", async () => {
+    const source = history(3);
+    const appendEntry = vi.fn();
+    const completeObservation = vi.fn(async (request) => candidate(request));
+    const completeReflection = vi.fn(async (request) => ({
+      text: JSON.stringify({
+        protocol: "observational-memory.reflection",
+        version: 1,
+        passId: request.passId,
+        parentReflectionId: request.parentReflection?.id ?? null,
+        coverage: { observationIds: request.coverage.observationIds },
+        reflectedHistory: ["Folded durable history."],
+      }),
+      usage,
+      provider: actor.provider,
+      model: actor.model,
+      stopReason: "stop" as const,
+    }));
+    const memory = createSessionMemory(
+      {
+        appendEntry,
+        estimateTokens(messages) {
+          return messages.length * 100;
+        },
+        completeObservation,
+        completeReflection,
+      },
+      {
+        ...DEFAULT_SETTINGS,
+        messageTokensTarget: 200,
+        messageTokensStartObservation: 400,
+        observationTokensTarget: 50,
+        observationTokensStartReflection: 100,
+      },
+    );
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry: source.ancestry,
+      actor,
+      inputTokens: 600,
+    };
+    memory.restore(snapshot);
+
+    const result = await memory.maintain(() => snapshot);
+
+    expect(result.observationsCreated).toBe(1);
+    expect(result.reflectionsCreated).toBe(1);
+    expect(completeObservation).toHaveBeenCalledOnce();
+    expect(completeReflection).toHaveBeenCalledOnce();
+    expect(appendEntry.mock.calls.map(([type]) => type)).toEqual([
+      "observational-memory:observation",
+      "observational-memory:reflection",
+    ]);
   });
 
   it("disabling preserves exact source and enabling restores projection", async () => {

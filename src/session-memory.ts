@@ -65,6 +65,10 @@ export interface SessionMemory {
   configure(settings: ObservationalMemorySettings): void;
   setEnabled(enabled: boolean): void;
   observe(snapshot: SessionSnapshot, signal?: AbortSignal): void;
+  maintain(
+    snapshot: () => SessionSnapshot,
+    signal?: AbortSignal,
+  ): Promise<MemoryCompactionResult>;
   compact(
     snapshot: SessionSnapshot,
     signal?: AbortSignal,
@@ -416,7 +420,7 @@ function completedStepBoundaries(entries: readonly SessionEntry[]): number[] {
   return boundaries;
 }
 
-function uncoveredRawTokens(
+function uncoveredMessageTokens(
   host: SessionMemoryHost,
   snapshot: SessionSnapshot,
   coveredEntryIds: readonly string[],
@@ -429,15 +433,31 @@ function uncoveredRawTokens(
   ) {
     return undefined;
   }
-  const coveredMessages = allSourceEntries
-    .slice(0, coveredEntryIds.length)
-    .flatMap(entryMessages);
   const uncoveredMessages = allSourceEntries
     .slice(coveredEntryIds.length)
     .flatMap(entryMessages);
-  const estimatedUncovered =
-    uncoveredMessages.length === 0 ? 0 : host.estimateTokens(uncoveredMessages);
-  if (snapshot.inputTokens === undefined) return estimatedUncovered;
+  return uncoveredMessages.length === 0
+    ? 0
+    : host.estimateTokens(uncoveredMessages);
+}
+
+function uncoveredRawTokens(
+  host: SessionMemoryHost,
+  snapshot: SessionSnapshot,
+  coveredEntryIds: readonly string[],
+): number | undefined {
+  const allSourceEntries = sourceEntries(snapshot.ancestry);
+  const estimatedUncovered = uncoveredMessageTokens(
+    host,
+    snapshot,
+    coveredEntryIds,
+  );
+  if (estimatedUncovered === undefined || snapshot.inputTokens === undefined) {
+    return estimatedUncovered;
+  }
+  const coveredMessages = allSourceEntries
+    .slice(0, coveredEntryIds.length)
+    .flatMap(entryMessages);
   const estimatedCovered =
     coveredMessages.length === 0 ? 0 : host.estimateTokens(coveredMessages);
   return Math.max(
@@ -456,15 +476,20 @@ function frozenPrefix(
   if (!snapshot.actor) return undefined;
   const policy = pressurePolicy(snapshot.actor, settings);
   const allSourceEntries = sourceEntries(snapshot.ancestry);
-  const uncoveredTokens = uncoveredRawTokens(host, snapshot, coveredEntryIds);
+  const uncoveredTokens = uncoveredMessageTokens(
+    host,
+    snapshot,
+    coveredEntryIds,
+  );
   const actorInputTokens =
     snapshot.inputTokens ??
     host.estimateTokens(allSourceEntries.flatMap(entryMessages));
-  const inputTokens = force
-    ? uncoveredTokens
-    : uncoveredTokens === undefined
-      ? actorInputTokens
-      : Math.max(actorInputTokens, uncoveredTokens);
+  const inputTokens =
+    force || settings
+      ? uncoveredTokens
+      : uncoveredTokens === undefined
+        ? actorInputTokens
+        : Math.max(actorInputTokens, uncoveredTokens);
   if (inputTokens === undefined || (!force && inputTokens < policy.soft)) {
     return undefined;
   }
@@ -1336,6 +1361,40 @@ export function createSessionMemory(
   let runningController: AbortController | undefined;
   let runningPromise: Promise<PassOutcome> | undefined;
   let runningObservation: FrozenObservation | undefined;
+  let runningCompletion: Promise<void> | undefined;
+
+  function beginRunning(): () => void {
+    let resolveCompletion!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    runningCompletion = completion;
+    return () => {
+      resolveCompletion();
+      if (runningCompletion === completion) runningCompletion = undefined;
+    };
+  }
+
+  async function waitForRunning(
+    signal: AbortSignal | undefined,
+  ): Promise<"settled" | "cancelled"> {
+    const completion = runningCompletion;
+    if (!completion) return "settled";
+    if (signal?.aborted) return "cancelled";
+    let removeAbortListener = (): void => {};
+    const cancelled = new Promise<"cancelled">((resolve) => {
+      const abortWait = () => resolve("cancelled");
+      signal?.addEventListener("abort", abortWait, { once: true });
+      removeAbortListener = () =>
+        signal?.removeEventListener("abort", abortWait);
+    });
+    const outcome = await Promise.race([
+      completion.then(() => "settled" as const),
+      cancelled,
+    ]);
+    removeAbortListener();
+    return outcome;
+  }
   let passNumber = 0;
   let reflectionPassNumber = 0;
   let ready: ReadyObservation | undefined;
@@ -1500,6 +1559,7 @@ export function createSessionMemory(
   ): Promise<PassOutcome> {
     running = true;
     runningObservation = frozen;
+    const finishRunning = beginRunning();
     const previousStatus = status;
     setStatus(
       previousStatus === "waiting for memory"
@@ -1563,6 +1623,7 @@ export function createSessionMemory(
             };
       } finally {
         signal?.removeEventListener("abort", abort);
+        finishRunning();
         if (runningController === controller) {
           runningController = undefined;
           running = false;
@@ -1716,7 +1777,7 @@ export function createSessionMemory(
           reflectionOutputBudget: settings?.reflectionTokensMax ?? 5_000,
         };
     const messageTokens =
-      uncoveredRawTokens(host, snapshot, coveredEntryIds()) ??
+      uncoveredMessageTokens(host, snapshot, coveredEntryIds()) ??
       host.estimateTokens(
         sourceEntries(snapshot.ancestry).flatMap(entryMessages),
       );
@@ -1859,6 +1920,7 @@ export function createSessionMemory(
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       running = true;
+      const finishRunning = beginRunning();
       const previousStatus = status;
       setStatus(
         previousStatus === "waiting for memory"
@@ -1909,6 +1971,7 @@ export function createSessionMemory(
         if (controller.signal.aborted) return "cancelled";
       } finally {
         signal?.removeEventListener("abort", abort);
+        finishRunning();
         if (runningController === controller) {
           runningController = undefined;
           running = false;
@@ -1934,6 +1997,7 @@ export function createSessionMemory(
       runningController = undefined;
       runningPromise = undefined;
       runningObservation = undefined;
+      runningCompletion = undefined;
       running = false;
       setStatus(undefined);
       const replayed = replayMemory(snapshot);
@@ -2019,6 +2083,53 @@ export function createSessionMemory(
       const frozen = freezeObservation(snapshot, false);
       if (!frozen) return;
       void executeObservation(frozen, signal, false);
+    },
+
+    async maintain(getSnapshot, signal) {
+      let observationsCreated = 0;
+      let reflectionsCreated = 0;
+      while (!disposed && enabled && !terminal && !signal?.aborted) {
+        const snapshot = getSnapshot();
+        if (ready) {
+          const messages = sourceEntries(snapshot.ancestry).flatMap(entryMessages);
+          const activation = activateReady(snapshot, messages);
+          if (activation === "ambiguous") break;
+          if (activation === "activated") {
+            observationsCreated += 1;
+            continue;
+          }
+        }
+        if (running) {
+          if ((await waitForRunning(signal)) === "cancelled") break;
+          continue;
+        }
+
+        if (
+          snapshot.actor &&
+          reflectionPrefix(
+            host,
+            snapshot.actor,
+            activeCommits,
+            activeReflections.at(-1),
+            settings,
+          )
+        ) {
+          const outcome = await reflect(snapshot, signal, false);
+          if (outcome !== "accepted") break;
+          reflectionsCreated += 1;
+          continue;
+        }
+
+        const frozen = freezeObservation(snapshot, false);
+        if (!frozen) break;
+        const outcome = await executeObservation(frozen, signal, false);
+        if (outcome.kind !== "ready") break;
+      }
+      return {
+        observationsCreated,
+        reflectionsCreated,
+        inspection: inspection(getSnapshot()),
+      };
     },
 
     async compact(snapshot, signal) {
@@ -2166,6 +2277,15 @@ export function createSessionMemory(
 
         if (reflectionRequired) {
           if (hardUnsafe) setStatus("waiting for memory");
+          if (running) {
+            if (!hardUnsafe) return projected;
+            if ((await waitForRunning(signal)) === "cancelled") {
+              stopActor("cancelled");
+              return messages;
+            }
+            if (disposed || lifecycleRevision !== projectRevision) return messages;
+            continue;
+          }
           const outcome = await reflect(snapshot, signal, hardUnsafe);
           if (disposed || lifecycleRevision !== projectRevision) return messages;
           if (outcome === "accepted") continue;
@@ -2182,7 +2302,6 @@ export function createSessionMemory(
 
         setStatus("waiting for memory");
         if (signal?.aborted) {
-          runningController?.abort(signal.reason);
           stopActor("cancelled");
           return messages;
         }
@@ -2190,11 +2309,19 @@ export function createSessionMemory(
         const inFlight = runningPromise;
         const inFlightFrozen = runningObservation;
         if (inFlight && inFlightFrozen) {
-          const abortInFlight = () => runningController?.abort(signal?.reason);
-          signal?.addEventListener("abort", abortInFlight, { once: true });
-          if (signal?.aborted) abortInFlight();
-          const firstOutcome = await inFlight;
-          signal?.removeEventListener("abort", abortInFlight);
+          let removeAbortListener = (): void => {};
+          const actorAborted = new Promise<undefined>((resolve) => {
+            const abortWait = () => resolve(undefined);
+            signal?.addEventListener("abort", abortWait, { once: true });
+            removeAbortListener = () =>
+              signal?.removeEventListener("abort", abortWait);
+          });
+          const firstOutcome = await Promise.race([inFlight, actorAborted]);
+          removeAbortListener();
+          if (firstOutcome === undefined) {
+            stopActor("cancelled");
+            return messages;
+          }
           if (disposed || lifecycleRevision !== projectRevision) return messages;
           if (firstOutcome.kind === "ready") continue;
           if (firstOutcome.kind === "cancelled") {
@@ -2243,6 +2370,7 @@ export function createSessionMemory(
       runningController = undefined;
       runningPromise = undefined;
       runningObservation = undefined;
+      runningCompletion = undefined;
       running = false;
       setStatus(undefined);
     },

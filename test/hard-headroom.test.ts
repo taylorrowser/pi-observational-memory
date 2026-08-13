@@ -173,6 +173,56 @@ describe("hard headroom", () => {
     expect(setStatus).toHaveBeenLastCalledWith(undefined);
   });
 
+  it("does not cancel session-owned observation when the waiting actor is aborted", async () => {
+    const { messages, ancestry } = sourceFixture();
+    const observation = deferred<ObservationResponse>();
+    let observationSignal: AbortSignal | undefined;
+    const completeObservation = vi.fn(
+      (request: ObservationRequest, signal?: AbortSignal) => {
+        observationSignal = signal;
+        return new Promise<ObservationResponse>((resolve, reject) => {
+          observation.promise.then(resolve, reject);
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      },
+    );
+    const abortActor = vi.fn();
+    const memory = createSessionMemory({
+      appendEntry: vi.fn(),
+      attributeUsage: vi.fn(),
+      estimateTokens: (estimatedMessages) =>
+        estimatedMessages.length === 1 ? 50 : estimatedMessages.length * 100,
+      completeObservation,
+      setStatus: vi.fn(),
+      abortActor,
+    });
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry,
+      actor,
+      inputTokens: 900,
+      fixedInputTokens: 0,
+    };
+    const sessionController = new AbortController();
+    const maintenance = memory.maintain(() => snapshot, sessionController.signal);
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+
+    const actorController = new AbortController();
+    const projection = memory.project(snapshot, messages, actorController.signal);
+    actorController.abort("actor stopped");
+    const projected = await projection;
+
+    expect(projected).toBe(messages);
+    expect(abortActor).toHaveBeenCalledOnce();
+    expect(sessionController.signal.aborted).toBe(false);
+    expect(observationSignal?.aborted).toBe(false);
+
+    observation.resolve(validResponse(completeObservation.mock.calls[0]![0]));
+    await maintenance;
+  });
+
   it("blocks on complete projected-request headroom even when raw pressure is below hard", async () => {
     const { messages, ancestry } = sourceFixture();
     const pending = deferred<ObservationResponse>();

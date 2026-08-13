@@ -59,25 +59,30 @@ function context(
   } as unknown as ExtensionContext;
 }
 
+function memoryCompactionResult() {
+  return {
+    observationsCreated: 0,
+    reflectionsCreated: 0,
+    inspection: {
+      observations: [],
+      metrics: {
+        messages: { tokens: 0, limit: 1, percent: 0 },
+        observations: { tokens: 0, limit: 1, percent: 0, count: 0 },
+        reflection: { tokens: 0, limit: 1, percent: 0 },
+      },
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+    },
+  };
+}
+
 function memorySpies(): SessionMemory {
   return {
     restore: vi.fn(),
     configure: vi.fn(),
     setEnabled: vi.fn(),
     observe: vi.fn(),
-    compact: vi.fn(async () => ({
-      observationsCreated: 0,
-      reflectionsCreated: 0,
-      inspection: {
-        observations: [],
-        metrics: {
-          messages: { tokens: 0, limit: 1, percent: 0 },
-          observations: { tokens: 0, limit: 1, percent: 0, count: 0 },
-          reflection: { tokens: 0, limit: 1, percent: 0 },
-        },
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
-      },
-    })),
+    maintain: vi.fn(async () => memoryCompactionResult()),
+    compact: vi.fn(async () => memoryCompactionResult()),
     inspect: vi.fn(() => ({
       observations: [],
       metrics: {
@@ -151,6 +156,153 @@ describe("observational-memory extension", () => {
     );
   });
 
+  it("starts session-owned catch-up immediately for a resumed session", async () => {
+    const { pi, handlers } = extensionApi();
+    const maintain = vi.fn(
+      async (_snapshot: () => unknown, _signal?: AbortSignal) =>
+        memoryCompactionResult(),
+    );
+    const memory = { ...memorySpies(), maintain };
+    const resumedAncestry: SessionEntry[] = [
+      {
+        type: "custom",
+        id: "resumed-source",
+        parentId: null,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        customType: "fixture",
+        data: {},
+      },
+    ];
+    const ctx = context(resumedAncestry, undefined, "resumed-session");
+
+    registerObservationalMemory(pi, () => memory);
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "resume" },
+      ctx,
+    );
+
+    await vi.waitFor(() =>
+      expect(maintain).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(maintain.mock.calls[0]?.[0]()).toEqual({
+      sessionId: "resumed-session",
+      ancestry: resumedAncestry,
+    });
+  });
+
+  it("runs another maintenance pass when a lifecycle kick arrives during active maintenance", async () => {
+    const { pi, handlers } = extensionApi();
+    let finishFirstPass!: (
+      result: ReturnType<typeof memoryCompactionResult>,
+    ) => void;
+    const maintain = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<ReturnType<typeof memoryCompactionResult>>((resolve) => {
+            finishFirstPass = resolve;
+          }),
+      )
+      .mockResolvedValue(memoryCompactionResult());
+    const ctx = context([]);
+
+    registerObservationalMemory(pi, () => ({ ...memorySpies(), maintain }));
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "resume" },
+      ctx,
+    );
+    await vi.waitFor(() => expect(maintain).toHaveBeenCalledOnce());
+
+    await handlers.get("turn_end")?.(
+      { type: "turn_end", turnIndex: 0, message: undefined, toolResults: [] },
+      ctx,
+    );
+    expect(maintain).toHaveBeenCalledOnce();
+
+    finishFirstPass(memoryCompactionResult());
+
+    await vi.waitFor(() => expect(maintain).toHaveBeenCalledTimes(2));
+  });
+
+  it("passes active Escape to Pi and uses a later idle Escape to stop background memory", async () => {
+    const { pi, handlers } = extensionApi();
+    let terminalInput:
+      | ((data: string) => { consume?: boolean; data?: string } | undefined)
+      | undefined;
+    let idle = false;
+    const ctx = {
+      ...context([]),
+      isIdle: () => idle,
+      ui: {
+        ...context([]).ui,
+        onTerminalInput(handler: typeof terminalInput) {
+          terminalInput = handler;
+          return vi.fn();
+        },
+      },
+    } as unknown as ExtensionContext;
+    const maintain = vi.fn(
+      (_snapshot: () => unknown, signal: AbortSignal) =>
+        new Promise<ReturnType<typeof memoryCompactionResult>>((resolve) => {
+          signal.addEventListener(
+            "abort",
+            () => resolve(memoryCompactionResult()),
+            { once: true },
+          );
+        }),
+    );
+    registerObservationalMemory(pi, () => ({ ...memorySpies(), maintain }));
+
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "resume" },
+      ctx,
+    );
+    await vi.waitFor(() => expect(maintain).toHaveBeenCalledOnce());
+
+    expect(terminalInput?.("\u001b")).toBeUndefined();
+    expect(maintain.mock.calls[0]?.[1].aborted).toBe(false);
+
+    idle = true;
+    expect(terminalInput?.("\u001b")).toEqual({ consume: true });
+    expect(maintain.mock.calls[0]?.[1].aborted).toBe(true);
+  });
+
+  it("aborts in-flight background maintenance before session shutdown disposal", async () => {
+    const { pi, handlers } = extensionApi();
+    let maintenanceSignal: AbortSignal | undefined;
+    const maintain = vi.fn(
+      (_snapshot: () => unknown, signal: AbortSignal) =>
+        new Promise<ReturnType<typeof memoryCompactionResult>>((resolve) => {
+          maintenanceSignal = signal;
+          signal.addEventListener(
+            "abort",
+            () => resolve(memoryCompactionResult()),
+            { once: true },
+          );
+        }),
+    );
+    const memory = { ...memorySpies(), maintain };
+    const ctx = context([]);
+    registerObservationalMemory(pi, () => memory);
+
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "resume" },
+      ctx,
+    );
+    await vi.waitFor(() => expect(maintain).toHaveBeenCalledOnce());
+
+    await handlers.get("session_shutdown")?.(
+      { type: "session_shutdown", reason: "quit" },
+      ctx,
+    );
+
+    expect(maintenanceSignal?.aborted).toBe(true);
+    expect(memory.dispose).toHaveBeenCalledOnce();
+  });
+
   it("routes the selected session lifecycle through one SessionMemory", async () => {
     const { pi, handlers, appendEntry } = extensionApi();
     const memory = memorySpies();
@@ -212,10 +364,8 @@ describe("observational-memory extension", () => {
       sessionId: "session-1",
       ancestry,
     });
-    expect(memory.observe).toHaveBeenCalledWith(
-      { sessionId: "session-1", ancestry },
-      abort.signal,
-    );
+    expect(memory.maintain).toHaveBeenCalled();
+    expect(memory.observe).not.toHaveBeenCalled();
     expect(memory.project).toHaveBeenCalledWith(
       { sessionId: "session-1", ancestry },
       messages,
@@ -223,7 +373,7 @@ describe("observational-memory extension", () => {
     );
     expect(contextResult).toEqual({ messages });
     expect(memory.dispose).toHaveBeenCalledOnce();
-    expect(memory.observe).toHaveBeenCalledOnce();
+    expect(memory.maintain).toHaveBeenCalledTimes(2);
     expect(memory.project).toHaveBeenCalledOnce();
     expect(lateContextResult).toBeUndefined();
     expect(appendEntry).not.toHaveBeenCalled();
@@ -318,20 +468,19 @@ describe("observational-memory extension", () => {
       ctx,
     );
 
-    expect(memory.observe).toHaveBeenCalledWith(
-      {
-        sessionId: "session-1",
-        ancestry: [],
-        actor: {
-          provider: "anthropic",
-          model: "claude-sonnet-4-5",
-          contextWindow: 200_000,
-          maxTokens: 8_192,
-        },
-        inputTokens: 125_000,
+    expect(memory.maintain).toHaveBeenCalledTimes(2);
+    const getSnapshot = vi.mocked(memory.maintain).mock.calls[1]?.[0];
+    expect(getSnapshot?.()).toEqual({
+      sessionId: "session-1",
+      ancestry: [],
+      actor: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+        contextWindow: 200_000,
+        maxTokens: 8_192,
       },
-      undefined,
-    );
+      inputTokens: 125_000,
+    });
   });
 
   it("includes the effective system prompt and active tool schemas in pre-request headroom", async () => {
