@@ -1385,6 +1385,14 @@ function sameMessage(
   left: ContextEvent["messages"][number],
   right: ContextEvent["messages"][number],
 ): boolean {
+  if (left.role === "custom" && right.role === "custom") {
+    // Pi timestamps a custom message when it is queued, then timestamps its
+    // CustomMessageEntry again when the queued message is persisted. Content
+    // identity is stable across those two representations; the timestamp is not.
+    const { timestamp: _leftTimestamp, ...leftStable } = left;
+    const { timestamp: _rightTimestamp, ...rightStable } = right;
+    return JSON.stringify(leftStable) === JSON.stringify(rightStable);
+  }
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
