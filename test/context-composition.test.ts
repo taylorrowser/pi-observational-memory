@@ -359,6 +359,134 @@ describe("context-extension composition", () => {
     },
   );
 
+  it("composes a persisted custom message whose runtime enqueue timestamp differs", async () => {
+    const customEntry: SessionEntry = {
+      type: "custom_message",
+      id: "entry-2",
+      parentId: "entry-1",
+      timestamp: "2026-01-01T00:00:03.000Z",
+      customType: "subagent-status",
+      content: "A queued subagent completed.",
+      display: true,
+    };
+    const assistant = {
+      role: "assistant" as const,
+      content: [{ type: "text" as const, text: "Completed exact step" }],
+      api: "anthropic-messages",
+      provider: actor.provider,
+      model: actor.model,
+      usage: zeroUsage,
+      stopReason: "stop" as const,
+      timestamp: 4,
+    };
+    const record = {
+      protocol: "observational-memory.observation",
+      version: 1,
+      id: "session-1:observation:1",
+      replayEpoch: "session-1",
+      parentCommitId: null,
+      coverage: {
+        entryIds: ["entry-1", "entry-2", "entry-3"],
+        startEntryId: "entry-1",
+        endEntryId: "entry-3",
+      },
+      observations: ["A queued subagent completed the covered step."],
+      activeTask: {
+        originalIntent: "Continue after the queued subagent.",
+        constraints: ["Preserve the custom message content."],
+        decisions: [],
+        verifiedProgress: [],
+        currentWork: ["Continue with the exact tail."],
+        blockers: [],
+        unresolvedQuestions: [],
+        nextMove: { owner: "assistant", action: "Continue safely." },
+      },
+      lineage: { parentCommitId: null },
+      producer: { provider: actor.provider, model: actor.model },
+      usage: zeroUsage,
+      timestamp: "2026-01-01T00:00:04.000Z",
+      fidelity: "normal",
+      promptVersion: 1,
+      outputEstimate: 20,
+      validation: { version: 1, checks: ["contiguous-coverage"] },
+    };
+    const ancestry: SessionEntry[] = [
+      messageEntry("entry-1", null, {
+        role: "user",
+        content: "Original exact request",
+        timestamp: 1,
+      }),
+      customEntry,
+      messageEntry("entry-3", "entry-2", assistant),
+      {
+        type: "custom",
+        id: "entry-4",
+        parentId: "entry-3",
+        timestamp: "2026-01-01T00:00:05.000Z",
+        customType: "observational-memory:observation",
+        data: record,
+      },
+      messageEntry("entry-5", "entry-4", {
+        role: "user",
+        content: "Continue with the tail",
+        timestamp: 5,
+      }),
+    ];
+    const incoming: ContextEvent["messages"] = [
+      { role: "user", content: "Original exact request", timestamp: 1 },
+      {
+        role: "custom",
+        customType: "subagent-status",
+        content: "A queued subagent completed.",
+        display: true,
+        timestamp: 2_000,
+      },
+      assistant,
+      { role: "user", content: "Continue with the tail", timestamp: 5 },
+    ];
+    const abortActor = vi.fn();
+    const memory = createSessionMemory(
+      {
+        appendEntry: vi.fn(),
+        estimateTokens: (messages) => messages.length * 300,
+        abortActor,
+        async completeObservation() {
+          throw new Error("unexpected observation");
+        },
+      },
+      {
+        enabled: true,
+        debugLogging: false,
+        messageTokensTarget: 100,
+        messageTokensStartObservation: 200,
+        hardHeadroomTokens: 1_000,
+        observationTokensTarget: 100,
+        observationTokensStartReflection: 1_000,
+        reflectionTokensMax: 100,
+      },
+    );
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry,
+      actor,
+      inputTokens: 900,
+    };
+    memory.restore(snapshot);
+    expect(memory.inspect(snapshot).observations).toHaveLength(1);
+
+    const projected = await memory.project(snapshot, incoming);
+
+    expect(abortActor).not.toHaveBeenCalled();
+    expect(projected).toHaveLength(2);
+    expect(projected[0]).toEqual(
+      expect.objectContaining({
+        role: "user",
+        content: expect.stringContaining("<observational-memory version=\"1\">"),
+      }),
+    );
+    expect(projected[1]).toEqual(incoming[3]);
+  });
+
   it("does not reflect committed observations whose covered baseline is ambiguous", async () => {
     const { covered, tail, ancestry } = committedFixture();
     const incoming = rewrittenContext(covered, tail);
