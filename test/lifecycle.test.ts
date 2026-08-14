@@ -314,6 +314,76 @@ describe("SessionMemory lifecycle changes", () => {
     ).toMatchObject({ role: "toolResult", isError: true });
   });
 
+  it("resumes observation after a persisted orphaned tool call is superseded", async () => {
+    const interruptedUser = messageEntry("orphan-user-1", null, {
+      role: "user",
+      content: "Start the interrupted work",
+      timestamp: 1,
+    });
+    const orphanedToolCall = messageEntry("orphan-assistant-1", interruptedUser.id, {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "orphan-call-1",
+          name: "bash",
+          arguments: { command: "long-running-command" },
+        },
+      ],
+      api: "anthropic-messages",
+      provider: actor.provider,
+      model: actor.model,
+      usage: zeroUsage,
+      stopReason: "toolUse",
+      timestamp: 2,
+    });
+    const resumedUser = messageEntry("orphan-user-2", orphanedToolCall.id, {
+      role: "user",
+      content: "The computer restarted; continue with the work",
+      timestamp: 3,
+    });
+    const resumedAssistant = messageEntry("orphan-assistant-2", resumedUser.id, {
+      role: "assistant",
+      content: [{ type: "text", text: "Resumed after the interruption" }],
+      api: "anthropic-messages",
+      provider: actor.provider,
+      model: actor.model,
+      usage: zeroUsage,
+      stopReason: "stop",
+      timestamp: 4,
+    });
+    const completeObservation = vi.fn(async (request: ObservationRequest) =>
+      validObservation(request),
+    );
+    const memory = createSessionMemory({
+      appendEntry: vi.fn(),
+      attributeUsage: vi.fn(),
+      estimateTokens: () => 100,
+      completeObservation,
+    });
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry: [
+        interruptedUser,
+        orphanedToolCall,
+        resumedUser,
+        resumedAssistant,
+      ],
+      actor,
+      inputTokens: 650,
+    };
+
+    memory.observe(snapshot);
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+
+    expect(completeObservation.mock.calls[0]?.[0].source.entryIds).toEqual([
+      "orphan-user-1",
+      "orphan-assistant-1",
+      "orphan-user-2",
+      "orphan-assistant-2",
+    ]);
+  });
+
   it("keeps failed and aborted assistant responses exact until a later complete boundary", async () => {
     const user = messageEntry("retry-user-1", null, {
       role: "user",

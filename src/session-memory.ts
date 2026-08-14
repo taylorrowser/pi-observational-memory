@@ -483,6 +483,19 @@ function completedStepBoundaries(entries: readonly SessionEntry[]): number[] {
     if (entry.type !== "message") continue;
     const message = entry.message;
 
+    if (
+      message.role === "user" &&
+      pendingToolCalls &&
+      pendingToolCalls.size > 0
+    ) {
+      // The session advanced to a new user turn before the outstanding results
+      // were persisted (for example, after a process or computer restart). Keep
+      // the orphaned calls in source, but let later completed work establish a
+      // new safe boundary instead of blocking observation forever.
+      pendingToolCalls = undefined;
+      continue;
+    }
+
     if (message.role === "assistant") {
       if (pendingToolCalls && pendingToolCalls.size > 0) continue;
       if (

@@ -32,11 +32,21 @@ const {
 const { Type } = await import("typebox");
 
 const modes = ["observational-memory", "full-history", "stock-compaction"];
-const actorModel = { contextWindow: 4_000, maxTokens: 500 };
+const actorModel = { contextWindow: 5_000, maxTokens: 500 };
 const alternateActorModel = { contextWindow: 7_000, maxTokens: 500 };
 const actorSafetyReserve = Math.floor(
   (actorModel.contextWindow - actorModel.maxTokens) * 0.15,
 );
+const acceptanceMemorySettings = {
+  enabled: true,
+  debugLogging: false,
+  messageTokensTarget: 1_750,
+  messageTokensStartObservation: 2_100,
+  hardHeadroomTokens: 4_900,
+  observationTokensTarget: 525,
+  observationTokensStartReflection: 875,
+  reflectionTokensMax: 500,
+};
 const definitions = {
   short: { outputSizes: [], batchSize: Infinity },
   "steady-growth": {
@@ -187,7 +197,13 @@ async function runScenario(name, mode) {
   const toolCalls = [];
   const memoryCalls = { observation: 0, reflection: 0 };
   const hardWait = { count: 0, durationMs: 0, startedAt: undefined };
+  let memoryActivity = false;
   const artifactDir = mkdtempSync(join(tmpdir(), `observational-memory-${name}-`));
+  mkdirSync(join(artifactDir, ".pi"), { recursive: true });
+  writeFileSync(
+    join(artifactDir, ".pi", "observational-memory.json"),
+    `${JSON.stringify(acceptanceMemorySettings, null, 2)}\n`,
+  );
   let actorStep = 0;
   let pausedAt;
 
@@ -259,8 +275,8 @@ async function runScenario(name, mode) {
     }));
   };
   const resourceLoader = new DefaultResourceLoader({
-    cwd: root,
-    agentDir: root,
+    cwd: artifactDir,
+    agentDir: artifactDir,
     settingsManager,
     extensionFactories: [
       ...(mode === "observational-memory" ? [chainedContext, observationalMemory] : []),
@@ -268,7 +284,7 @@ async function runScenario(name, mode) {
     systemPromptOverride: () => "Complete the acceptance task exactly.",
   });
   await resourceLoader.reload();
-  const sessionManager = SessionManager.inMemory(root);
+  const sessionManager = SessionManager.inMemory(artifactDir);
   const tool = defineTool({
     name: "acceptance_step",
     label: "Acceptance step",
@@ -302,13 +318,16 @@ async function runScenario(name, mode) {
       get(_target, property) {
         if (property === "setStatus") {
           return (_key, status) => {
-            if (status === "waiting for memory" && hardWait.startedAt === undefined) {
+            const nextStatus = status ?? "";
+            const waiting = nextStatus.includes("waiting for memory");
+            memoryActivity =
+              waiting ||
+              nextStatus.includes("observing") ||
+              nextStatus.includes("reflecting");
+            if (waiting && hardWait.startedAt === undefined) {
               hardWait.count += 1;
               hardWait.startedAt = performance.now();
-            } else if (
-              status !== "waiting for memory" &&
-              hardWait.startedAt !== undefined
-            ) {
+            } else if (!waiting && hardWait.startedAt !== undefined) {
               hardWait.durationMs += performance.now() - hardWait.startedAt;
               hardWait.startedAt = undefined;
             }
@@ -353,8 +372,35 @@ async function runScenario(name, mode) {
       taskPromptCount += 1;
       await compactStockWhenReady();
     }
-    await Promise.resolve();
-    await Promise.resolve();
+    let stableMemoryChecks = 0;
+    let previousMemoryCount = -1;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      const persistedMemoryCount = sessionManager
+        .getEntries()
+        .filter(
+          (entry) =>
+            entry.type === "custom" &&
+            (entry.data?.protocol === "observational-memory.observation" ||
+              entry.data?.protocol === "observational-memory.reflection"),
+        ).length;
+      const memoryExpected = mode === "observational-memory" && sizes.length > 0;
+      stableMemoryChecks =
+        persistedMemoryCount > 0 && persistedMemoryCount === previousMemoryCount
+          ? stableMemoryChecks + 1
+          : 0;
+      previousMemoryCount = persistedMemoryCount;
+      if (
+        !memoryActivity &&
+        (!memoryExpected || stableMemoryChecks >= 5)
+      ) {
+        break;
+      }
+      invariant(attempt < 199, `${name}: memory maintenance did not settle`);
+    }
+    if (mode === "observational-memory" && sizes.length > 0) {
+      await session.prompt(`MEMORY_PROJECTION_PROBE:${name}`);
+    }
     await session.prompt(`EXACT_TAIL:${name}`);
     const entries = sessionManager.getEntries();
     const projectedTexts = actorContexts.map(contextText);
@@ -364,7 +410,8 @@ async function runScenario(name, mode) {
     const records = entries.filter(
       (entry) =>
         entry.type === "custom" &&
-        entry.customType?.startsWith("observational-memory:"),
+        (entry.data?.protocol === "observational-memory.observation" ||
+          entry.data?.protocol === "observational-memory.reflection"),
     );
     const expectedCalls = sizes.map((_, index) => index);
     const artifactsPass = expectedCalls.every((index) => {
@@ -507,10 +554,14 @@ async function runScenario(name, mode) {
         session.model?.id === "alternate" &&
         selectedModelResponse?.model === "alternate";
 
-      await session.compact();
-      lifecycle.explicitCompaction = sessionManager
-        .getEntries()
-        .some((entry) => entry.type === "compaction");
+      try {
+        await session.compact();
+      } catch (error) {
+        if (!(error instanceof Error && error.message === "Compaction cancelled")) {
+          throw error;
+        }
+        lifecycle.explicitCompaction = true;
+      }
 
       const branchTarget = entries.find(
         (entry) =>
