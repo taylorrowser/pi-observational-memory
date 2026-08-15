@@ -52,6 +52,7 @@ describe("Pi SessionMemory host", () => {
       model: "claude-sonnet-4-5",
       usage: responseUsage,
       stopReason: "stop" as const,
+      errorMessage: "provider diagnostic",
       timestamp: 1,
     }));
     const pi = { appendEntry: vi.fn() } as unknown as ExtensionAPI;
@@ -65,6 +66,28 @@ describe("Pi SessionMemory host", () => {
       summary: "Approach A may have completed the migration.",
       fromHook: true,
     } satisfies SessionEntry;
+    const transportOnlyEntry = {
+      type: "message",
+      id: "entry-2",
+      parentId: "entry-1",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "thinking",
+            thinking: "Semantic reasoning remains observable.",
+            thinkingSignature: "provider-only-signature",
+          },
+        ],
+        api: "anthropic-messages",
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+        usage: responseUsage,
+        stopReason: "stop",
+        timestamp: 1,
+      },
+    } as SessionEntry;
     const request: ObservationRequest = {
       passId: "session-1:observation:1",
       parentCommitId: null,
@@ -85,7 +108,10 @@ describe("Pi SessionMemory host", () => {
         observationHigh: 47_952,
         reflectionOutputBudget: 8_192,
       },
-      source: { entryIds: ["entry-1"], entries: [sourceEntry] },
+      source: {
+        entryIds: ["entry-1", "entry-2"],
+        entries: [sourceEntry, transportOnlyEntry],
+      },
     };
     const abort = new AbortController();
 
@@ -116,12 +142,21 @@ describe("Pi SessionMemory host", () => {
         maxTokens: 8_192,
       }),
     );
+    const completedContext = completeModel.mock.calls[0] as unknown as [
+      unknown,
+      { messages: Array<{ content: string }> },
+    ];
+    const observerPayload = completedContext[1].messages[0]?.content;
+    expect(observerPayload).toContain("Semantic reasoning remains observable.");
+    expect(observerPayload).not.toContain("provider-only-signature");
+    expect(observerPayload).not.toContain('"usage"');
     expect(response).toEqual({
       text: '{"protocol":"observational-memory.observation"}',
       provider: "anthropic",
       model: "claude-sonnet-4-5",
       usage: responseUsage,
       stopReason: "stop",
+      errorMessage: "provider diagnostic",
     });
   });
 

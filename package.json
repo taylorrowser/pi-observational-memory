@@ -1,6 +1,6 @@
 {
   "name": "@taylorrowser/pi-observational-memory",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Session-scoped observational memory for Pi",
   "type": "module",
   "keywords": [
