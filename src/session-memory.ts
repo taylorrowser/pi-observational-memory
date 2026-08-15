@@ -130,6 +130,7 @@ export interface ObservationResponse {
   readonly provider: string;
   readonly model: string;
   readonly stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+  readonly errorMessage?: string;
 }
 
 export interface ReflectionObservation {
@@ -678,6 +679,7 @@ type ObservationRejection =
   | {
       readonly kind: "stop-reason";
       readonly stopReason: ObservationResponse["stopReason"];
+      readonly errorMessage?: string;
     }
   | { readonly kind: "empty-output" }
   | {
@@ -727,7 +729,11 @@ function parseCandidate(
   if (response.stopReason !== "stop") {
     return {
       kind: "rejected",
-      rejection: { kind: "stop-reason", stopReason: response.stopReason },
+      rejection: {
+        kind: "stop-reason",
+        stopReason: response.stopReason,
+        ...(response.errorMessage ? { errorMessage: response.errorMessage } : {}),
+      },
     };
   }
   if (!response.text.trim()) {
@@ -1593,7 +1599,11 @@ export function createSessionMemory(
   function describeRejection(rejection: ObservationRejection): string {
     switch (rejection.kind) {
       case "stop-reason":
-        return `stop reason: ${rejection.stopReason}`;
+        return `stop reason: ${rejection.stopReason}${
+          rejection.errorMessage
+            ? ` (${boundedDetail(rejection.errorMessage)})`
+            : ""
+        }`;
       case "empty-output":
         return "empty output";
       case "provider-mismatch":

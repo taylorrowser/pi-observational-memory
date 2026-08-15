@@ -2,6 +2,7 @@ import {
   estimateTokens,
   type ExtensionAPI,
   type ExtensionContext,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 
@@ -46,6 +47,33 @@ provider errors and aborted, truncated, or partial assistant responses with thei
 For large tool results, preserve the task-relevant findings and enough literal retrieval breadcrumbs to recover
 omitted detail from the exact session JSONL with rg. Prefer useful source entry IDs, tool names and commands,
 paths, symbols, distinctive errors or literals, and explicitly state when full detail remains only in JSONL.`;
+
+function observerSource(entries: readonly SessionEntry[]): unknown[] {
+  return entries.map((entry) => {
+    if (entry.type !== "message") return entry;
+
+    const message = entry.message;
+    if (message.role === "assistant") {
+      const { usage: _usage, ...semanticMessage } = message;
+      return {
+        ...entry,
+        message: {
+          ...semanticMessage,
+          content: message.content.map((content) => {
+            if (content.type !== "thinking") return content;
+            const { thinkingSignature: _signature, ...semanticContent } = content;
+            return semanticContent;
+          }),
+        },
+      };
+    }
+    if (message.role === "toolResult") {
+      const { usage: _usage, ...semanticMessage } = message;
+      return { ...entry, message: semanticMessage };
+    }
+    return entry;
+  });
+}
 
 const REFLECTOR_PROMPT = `You are the Reflector for observational memory.
 Return only one JSON object, without Markdown fences, in this exact shape:
@@ -114,6 +142,7 @@ export function createPiHost(
       provider: response.provider,
       model: response.model,
       stopReason: response.stopReason,
+      ...(response.errorMessage ? { errorMessage: response.errorMessage } : {}),
     };
   }
 
@@ -145,7 +174,7 @@ export function createPiHost(
           passId: request.passId,
           parentCommitId: request.parentCommitId,
           activeMemory: request.activeMemory ?? null,
-          source: request.source.entries,
+          source: observerSource(request.source.entries),
           coverage: { entryIds: request.source.entryIds },
         },
         request.pressure.observationOutputBudget,

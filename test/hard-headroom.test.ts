@@ -538,6 +538,7 @@ describe("hard headroom", () => {
       .mockImplementationOnce(async (request) => ({
         ...validResponse(request),
         stopReason: "length",
+        errorMessage: "Codex error: input exceeds the context window",
       }));
     const appendEntry = vi.fn();
     const abortActor = vi.fn();
@@ -569,7 +570,7 @@ describe("hard headroom", () => {
     );
     expect(appendEntry).not.toHaveBeenCalled();
     expect(abortActor).toHaveBeenCalledWith(
-      "Observational memory could not restore safe headroom; exact source was preserved. Attempts failed: 1) exception (Error: observer transport unavailable); 2) invalid response (stop reason: length).",
+      "Observational memory could not restore safe headroom; exact source was preserved. Attempts failed: 1) exception (Error: observer transport unavailable); 2) invalid response (stop reason: length (Codex error: input exceeds the context window)).",
     );
   });
 
