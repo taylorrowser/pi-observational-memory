@@ -2148,37 +2148,56 @@ export function createSessionMemory(
     );
   }
 
-  function recoverCanonicalProjection(
+  function recoverCanonicalContext(
     snapshot: SessionSnapshot,
   ): ContextEvent["messages"] | undefined {
     // The durable branch is the replay authority. If only Pi's live message
-    // objects drifted, rebuild from persisted source rather than aborting a
-    // projection that is still safely below hard headroom.
+    // objects drifted, rebuild from persisted source and let the normal hard-
+    // pressure coordinator wait for or launch any memory work still required.
     const canonical = sourceEntries(snapshot.ancestry).flatMap(entryMessages);
     if (ready && activateReady(snapshot, canonical) === "ambiguous") {
       return undefined;
     }
-    if (!canCompose(snapshot, canonical, activeCommits)) return undefined;
 
-    const recovered = projection(snapshot, canonical);
-    if (
-      recovered.ambiguous ||
-      isHardUnsafe(snapshot, canonical, recovered.messages)
-    ) {
-      return undefined;
+    let reconciledLineage = false;
+    const composes = () =>
+      canCompose(snapshot, canonical, activeCommits) &&
+      !projection(snapshot, canonical).ambiguous;
+    let canonicalComposes = composes();
+    if (!canonicalComposes && !ready && !running) {
+      const previousCommits = activeCommits;
+      const previousReflections = activeReflections;
+      const previousPassNumber = passNumber;
+      const previousReflectionPassNumber = reflectionPassNumber;
+      const replayed = replayMemory(snapshot);
+      activeCommits = replayed.commits;
+      activeReflections = replayed.reflections;
+      passNumber = replayed.observationEntryCount;
+      reflectionPassNumber = replayed.reflectionEntryCount;
+      canonicalComposes = composes();
+      if (!canonicalComposes) {
+        activeCommits = previousCommits;
+        activeReflections = previousReflections;
+        passNumber = previousPassNumber;
+        reflectionPassNumber = previousReflectionPassNumber;
+        return undefined;
+      }
+      reconciledLineage = true;
     }
+    if (!canonicalComposes) return undefined;
 
     if (!canonicalRecovery) {
       emitDebugEvent(snapshot, {
         event: "hard-headroom-recovered",
         operation: "hard-headroom",
         reason: "canonical-source",
-        detail:
-          "runtime context did not compose; projected durable session source",
+        detail: reconciledLineage
+          ? "runtime context did not compose; recovered durable session source and memory lineage"
+          : "runtime context did not compose; recovered durable session source",
       });
     }
     canonicalRecovery = true;
-    return recovered.messages;
+    return canonical;
   }
 
   async function reflect(
@@ -2659,39 +2678,76 @@ export function createSessionMemory(
     async project(snapshot, messages, signal) {
       if (disposed) return messages;
       if (!enabled) return projection(snapshot, messages).messages;
+      let workingMessages = messages;
       if (terminal) {
-        host.abortActor?.();
-        return messages;
+        if (!ready && isIncomingHardUnsafe(snapshot, workingMessages)) {
+          const current = projection(snapshot, workingMessages);
+          if (
+            current.ambiguous ||
+            isHardUnsafe(snapshot, workingMessages, current.messages)
+          ) {
+            const recovered = recoverCanonicalContext(snapshot);
+            if (!recovered) {
+              host.abortActor?.();
+              return messages;
+            }
+            const recoveredProjection = projection(snapshot, recovered);
+            if (
+              recoveredProjection.ambiguous ||
+              isHardUnsafe(
+                snapshot,
+                recovered,
+                recoveredProjection.messages,
+              )
+            ) {
+              host.abortActor?.();
+              return messages;
+            }
+            workingMessages = recovered;
+          }
+        }
+        terminal = false;
+        setStatus(undefined);
       }
       const projectRevision = lifecycleRevision;
 
       while (!disposed && lifecycleRevision === projectRevision) {
         let activation: "none" | "activated" | "ambiguous" = "none";
         if (signal?.aborted) ready = undefined;
-        else activation = activateReady(snapshot, messages);
+        else activation = activateReady(snapshot, workingMessages);
         if (
           activation === "ambiguous" ||
-          !canCompose(snapshot, messages, activeCommits)
+          !canCompose(snapshot, workingMessages, activeCommits)
         ) {
-          if (isIncomingHardUnsafe(snapshot, messages)) {
-            const recovered = recoverCanonicalProjection(snapshot);
-            if (recovered) return recovered;
+          if (isIncomingHardUnsafe(snapshot, workingMessages)) {
+            const recovered = recoverCanonicalContext(snapshot);
+            if (recovered) {
+              workingMessages = recovered;
+              continue;
+            }
             stopActor(snapshot, "exhausted");
           }
           return messages;
         }
-        const composition = projection(snapshot, messages);
+        const composition = projection(snapshot, workingMessages);
         const projected = composition.messages;
         if (composition.ambiguous) {
-          if (isIncomingHardUnsafe(snapshot, messages)) {
-            const recovered = recoverCanonicalProjection(snapshot);
-            if (recovered) return recovered;
+          if (isIncomingHardUnsafe(snapshot, workingMessages)) {
+            const recovered = recoverCanonicalContext(snapshot);
+            if (recovered) {
+              workingMessages = recovered;
+              continue;
+            }
             stopActor(snapshot, "exhausted");
           }
           return messages;
         }
-        canonicalRecovery = false;
-        const hardUnsafe = isHardUnsafe(snapshot, messages, projected);
+        if (workingMessages === messages) canonicalRecovery = false;
+        const hardUnsafe = isHardUnsafe(
+          snapshot,
+          workingMessages,
+          projected,
+        );
         const reflectionRequired =
           snapshot.actor &&
           reflectionPrefix(

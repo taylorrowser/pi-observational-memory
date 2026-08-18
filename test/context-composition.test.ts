@@ -560,6 +560,174 @@ describe("context-extension composition", () => {
     expect(abortActor).not.toHaveBeenCalled();
   });
 
+  it("waits for running memory after canonical recovery remains above hard pressure", async () => {
+    const { covered, tail, ancestry } = committedFixture();
+    const incoming = rewrittenContext(covered, tail);
+    let finishObservation!: () => void;
+    const completeObservation = vi.fn(
+      (request: ObservationRequest) =>
+        new Promise<ReturnType<typeof validObservation>>((resolve) => {
+          finishObservation = () => resolve(validObservation(request));
+        }),
+    );
+    const appendEntry = vi.fn();
+    const abortActor = vi.fn();
+    const setStatus = vi.fn();
+    const memory = createSessionMemory(
+      {
+        appendEntry,
+        attributeUsage: vi.fn(),
+        estimateTokens: (messages) =>
+          messages.some(
+            (message) =>
+              message.role === "user" &&
+              message.content === "Rewritten by another extension",
+          )
+            ? 900
+            : messages.length === 1 &&
+                messages[0]?.role === "user" &&
+                typeof messages[0].content === "string" &&
+                (messages[0].content.startsWith("[") ||
+                  messages[0].content.startsWith("{"))
+              ? 20
+              : messages.length * 100,
+        completeObservation,
+        setStatus,
+        abortActor,
+      },
+      {
+        enabled: true,
+        debugLogging: false,
+        messageTokensTarget: 50,
+        messageTokensStartObservation: 100,
+        hardHeadroomTokens: 850,
+        observationTokensTarget: 100,
+        observationTokensStartReflection: 700,
+        reflectionTokensMax: 100,
+      },
+    );
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry,
+      actor,
+      inputTokens: 900,
+      fixedInputTokens: 600,
+    };
+    memory.restore(snapshot);
+    memory.observe(snapshot);
+    await vi.waitFor(() => expect(completeObservation).toHaveBeenCalledOnce());
+
+    let settled = false;
+    const projection = memory.project(snapshot, incoming).finally(() => {
+      settled = true;
+    });
+    await vi.waitFor(() =>
+      expect(setStatus).toHaveBeenCalledWith(
+        "observing — waiting for memory",
+      ),
+    );
+    expect(settled).toBe(false);
+    expect(abortActor).not.toHaveBeenCalled();
+
+    finishObservation();
+    const projected = await projection;
+
+    expect(projected).toEqual([
+      expect.objectContaining({
+        role: "user",
+        content: expect.stringContaining("<observational-memory version=\"1\">"),
+      }),
+    ]);
+    expect(appendEntry).toHaveBeenCalledOnce();
+    expect(abortActor).not.toHaveBeenCalled();
+  });
+
+  it("reconciles in-memory lineage from durable source before aborting", async () => {
+    const original = committedFixture();
+    const originalRecord = original.ancestry[2];
+    if (
+      originalRecord?.type !== "custom" ||
+      originalRecord.customType !== "observational-memory:observation"
+    ) {
+      throw new Error("Expected observation fixture record");
+    }
+    const durableCovered = original.covered.map((message) => ({ ...message }));
+    const durableTail = original.tail.map((message) => ({ ...message }));
+    const durableAncestry: SessionEntry[] = [
+      messageEntry("durable-1", null, durableCovered[0]!),
+      messageEntry("durable-2", "durable-1", durableCovered[1]!),
+      {
+        ...originalRecord,
+        id: "durable-3",
+        parentId: "durable-2",
+        data: {
+          ...(originalRecord.data as Record<string, unknown>),
+          coverage: {
+            entryIds: ["durable-1", "durable-2"],
+            startEntryId: "durable-1",
+            endEntryId: "durable-2",
+          },
+        },
+      },
+      messageEntry("durable-4", "durable-3", durableTail[0]!),
+      messageEntry("durable-5", "durable-4", durableTail[1]!),
+    ];
+    const appendEntry = vi.fn();
+    const abortActor = vi.fn();
+    const completeObservation = vi.fn();
+    const memory = createSessionMemory(
+      {
+        appendEntry,
+        attributeUsage: vi.fn(),
+        estimateTokens: (messages) =>
+          messages.some(
+            (message) =>
+              message.role === "user" &&
+              message.content === "Rewritten by another extension",
+          )
+            ? 300
+            : messages.length * 10,
+        completeObservation,
+        setStatus: vi.fn(),
+        abortActor,
+      },
+      {
+        enabled: true,
+        debugLogging: false,
+        messageTokensTarget: 50,
+        messageTokensStartObservation: 100,
+        hardHeadroomTokens: 250,
+        observationTokensTarget: 100,
+        observationTokensStartReflection: 200,
+        reflectionTokensMax: 50,
+      },
+    );
+    memory.restore({ sessionId: "session-1", ancestry: original.ancestry });
+    const snapshot = {
+      sessionId: "session-1",
+      ancestry: durableAncestry,
+      actor,
+      inputTokens: 40,
+      fixedInputTokens: 0,
+    };
+
+    const projected = await memory.project(
+      snapshot,
+      rewrittenContext(durableCovered, durableTail),
+    );
+
+    expect(abortActor).not.toHaveBeenCalled();
+    expect(projected).toEqual([
+      expect.objectContaining({
+        role: "user",
+        content: expect.stringContaining("<observational-memory version=\"1\">"),
+      }),
+      ...durableTail,
+    ]);
+    expect(completeObservation).not.toHaveBeenCalled();
+    expect(appendEntry).not.toHaveBeenCalled();
+  });
+
   it("recovers committed coverage from durable source when runtime composition drifts at hard pressure", async () => {
     const { covered, tail, ancestry } = committedFixture();
     const incoming = rewrittenContext(covered, tail);
