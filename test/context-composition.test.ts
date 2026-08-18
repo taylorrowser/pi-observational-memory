@@ -183,7 +183,8 @@ async function readyCompositionFixture(
       messages.length === 1 &&
       messages[0]?.role === "user" &&
       typeof messages[0].content === "string" &&
-      messages[0].content.startsWith("{")
+      (messages[0].content.startsWith("{") ||
+        messages[0].content.startsWith("["))
         ? 20
         : messages.length * tokensPerMessage,
     completeObservation,
@@ -531,7 +532,7 @@ describe("context-extension composition", () => {
     expect(abortActor).not.toHaveBeenCalled();
   });
 
-  it("stops hard pressure without launching more work when ready coverage cannot compose", async () => {
+  it("recovers ready coverage from durable source when runtime composition drifts at hard pressure", async () => {
     const {
       memory,
       snapshot,
@@ -541,13 +542,25 @@ describe("context-extension composition", () => {
       completeObservation,
     } = await readyCompositionFixture(900, 250);
 
-    expect(await memory.project(snapshot, incoming)).toBe(incoming);
+    const projected = await memory.project(snapshot, incoming);
+
+    expect(projected).not.toBe(incoming);
+    expect(projected).toEqual([
+      expect.objectContaining({
+        role: "user",
+        content: expect.stringContaining("<observational-memory version=\"1\">"),
+      }),
+      expect.objectContaining({ content: "Continue with the tail" }),
+      expect.objectContaining({
+        content: [{ type: "text", text: "Current exact work" }],
+      }),
+    ]);
     expect(completeObservation).toHaveBeenCalledOnce();
-    expect(appendEntry).not.toHaveBeenCalled();
-    expect(abortActor).toHaveBeenCalledOnce();
+    expect(appendEntry).toHaveBeenCalledOnce();
+    expect(abortActor).not.toHaveBeenCalled();
   });
 
-  it("stops immediately at hard pressure when covered baseline source was rewritten", async () => {
+  it("recovers committed coverage from durable source when runtime composition drifts at hard pressure", async () => {
     const { covered, tail, ancestry } = committedFixture();
     const incoming = rewrittenContext(covered, tail);
     const completeObservation = vi.fn(async () => {
@@ -560,12 +573,18 @@ describe("context-extension composition", () => {
       appendEntry,
       attributeUsage: vi.fn(),
       estimateTokens: (messages) =>
-        messages.length === 1 &&
-        messages[0]?.role === "user" &&
-        typeof messages[0].content === "string" &&
-        messages[0].content.startsWith("[")
-          ? 20
-          : messages.length * 10,
+        messages.some(
+          (message) =>
+            message.role === "user" &&
+            message.content === "Rewritten by another extension",
+        )
+          ? 900
+          : messages.length === 1 &&
+              messages[0]?.role === "user" &&
+              typeof messages[0].content === "string" &&
+              messages[0].content.startsWith("[")
+            ? 20
+            : messages.length * 10,
       completeObservation,
       setStatus,
       abortActor,
@@ -574,15 +593,24 @@ describe("context-extension composition", () => {
       sessionId: "session-1",
       ancestry,
       actor,
-      inputTokens: 900,
+      inputTokens: 100,
     };
     memory.restore(snapshot);
 
-    expect(await memory.project(snapshot, incoming)).toBe(incoming);
+    const projected = await memory.project(snapshot, incoming);
+
+    expect(projected).not.toBe(incoming);
+    expect(projected).toEqual([
+      expect.objectContaining({
+        role: "user",
+        content: expect.stringContaining("<observational-memory version=\"1\">"),
+      }),
+      ...tail,
+    ]);
     expect(completeObservation).not.toHaveBeenCalled();
     expect(appendEntry).not.toHaveBeenCalled();
-    expect(abortActor).toHaveBeenCalledOnce();
-    expect(setStatus).toHaveBeenLastCalledWith(
+    expect(abortActor).not.toHaveBeenCalled();
+    expect(setStatus).not.toHaveBeenCalledWith(
       "memory stopped — source preserved",
     );
   });

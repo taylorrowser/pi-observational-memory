@@ -261,6 +261,7 @@ export type MemoryDebugEventName =
   | "reflection-cancelled"
   | "reflection-retry"
   | "hard-headroom-wait"
+  | "hard-headroom-recovered"
   | "hard-headroom-terminal";
 
 export type MemoryDebugReason =
@@ -301,6 +302,7 @@ export type MemoryDebugReason =
   | "observation-required"
   | "reflection-required"
   | "cancelled"
+  | "canonical-source"
   | "exhausted";
 
 export interface MemoryDebugEvent {
@@ -1570,6 +1572,7 @@ export function createSessionMemory(
   let lifecycleRevision = 0;
   let status: string | undefined;
   let terminal = false;
+  let canonicalRecovery = false;
   let settings = initialSettings;
   let enabled = settings?.enabled ?? true;
 
@@ -2145,6 +2148,39 @@ export function createSessionMemory(
     );
   }
 
+  function recoverCanonicalProjection(
+    snapshot: SessionSnapshot,
+  ): ContextEvent["messages"] | undefined {
+    // The durable branch is the replay authority. If only Pi's live message
+    // objects drifted, rebuild from persisted source rather than aborting a
+    // projection that is still safely below hard headroom.
+    const canonical = sourceEntries(snapshot.ancestry).flatMap(entryMessages);
+    if (ready && activateReady(snapshot, canonical) === "ambiguous") {
+      return undefined;
+    }
+    if (!canCompose(snapshot, canonical, activeCommits)) return undefined;
+
+    const recovered = projection(snapshot, canonical);
+    if (
+      recovered.ambiguous ||
+      isHardUnsafe(snapshot, canonical, recovered.messages)
+    ) {
+      return undefined;
+    }
+
+    if (!canonicalRecovery) {
+      emitDebugEvent(snapshot, {
+        event: "hard-headroom-recovered",
+        operation: "hard-headroom",
+        reason: "canonical-source",
+        detail:
+          "runtime context did not compose; projected durable session source",
+      });
+    }
+    canonicalRecovery = true;
+    return recovered.messages;
+  }
+
   async function reflect(
     snapshot: SessionSnapshot,
     signal: AbortSignal | undefined,
@@ -2332,6 +2368,7 @@ export function createSessionMemory(
       lifecycleRevision += 1;
       ready = undefined;
       terminal = false;
+      canonicalRecovery = false;
       runningController?.abort("session ancestry restored");
       runningController = undefined;
       runningPromise = undefined;
@@ -2636,15 +2673,24 @@ export function createSessionMemory(
           activation === "ambiguous" ||
           !canCompose(snapshot, messages, activeCommits)
         ) {
-          if (isIncomingHardUnsafe(snapshot, messages)) stopActor(snapshot, "exhausted");
+          if (isIncomingHardUnsafe(snapshot, messages)) {
+            const recovered = recoverCanonicalProjection(snapshot);
+            if (recovered) return recovered;
+            stopActor(snapshot, "exhausted");
+          }
           return messages;
         }
         const composition = projection(snapshot, messages);
         const projected = composition.messages;
         if (composition.ambiguous) {
-          if (isIncomingHardUnsafe(snapshot, messages)) stopActor(snapshot, "exhausted");
+          if (isIncomingHardUnsafe(snapshot, messages)) {
+            const recovered = recoverCanonicalProjection(snapshot);
+            if (recovered) return recovered;
+            stopActor(snapshot, "exhausted");
+          }
           return messages;
         }
+        canonicalRecovery = false;
         const hardUnsafe = isHardUnsafe(snapshot, messages, projected);
         const reflectionRequired =
           snapshot.actor &&
