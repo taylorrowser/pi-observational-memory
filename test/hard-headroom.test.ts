@@ -522,6 +522,12 @@ describe("hard headroom", () => {
 
     expect(await memory.project(snapshot, messages)).toBe(messages);
     expect(abortActor).toHaveBeenNthCalledWith(2);
+
+    const safeMessages = messages.slice(0, 2);
+    const safeSnapshot = { ...snapshot, inputTokens: 500 };
+    expect(await memory.project(safeSnapshot, safeMessages)).toBe(safeMessages);
+    expect(abortActor).toHaveBeenCalledTimes(2);
+    expect(setStatus).toHaveBeenLastCalledWith(undefined);
   });
 
   it("reports both classified hard-paused attempt failures without advancing source coverage", async () => {
