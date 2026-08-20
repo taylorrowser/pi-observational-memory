@@ -133,34 +133,73 @@ export function registerObservationalMemory(
   createMemory: SessionMemoryFactory = createSessionMemory,
 ): void {
   let currentContext: ExtensionContext | undefined;
-  const piHost = createPiHost(pi, () => currentContext);
+  let runtimeGeneration = 0;
   let memory: SessionMemory | undefined;
+  let host: SessionMemoryHost | undefined;
   let settings: ObservationalMemorySettings | undefined;
   let activity: string | undefined;
+  let refreshRuntimeStatus:
+    | ((inspection?: MemoryInspection) => void)
+    | undefined;
+  let notifyRuntimeError: ((message: string) => void) | undefined;
   let allowNextStockCompaction = false;
   let maintenanceController: AbortController | undefined;
   let maintenanceTask: Promise<unknown> | undefined;
   let maintenanceRequested = false;
   let removeTerminalInputListener: (() => void) | undefined;
-  const host: SessionMemoryHost = {
-    ...piHost,
-    debugEvent(event) {
-      pi.appendEntry(DEBUG_EVENT_CUSTOM_TYPE, event);
-      const isRoutineMaintenanceEvent =
-        event.event === "maintenance-requested" ||
-        event.event === "maintenance-started" ||
-        (event.event === "maintenance-completed" &&
-          event.reason === "settled" &&
-          event.detail === "0 observations, 0 reflections");
-      if (!isRoutineMaintenanceEvent) {
-        currentContext?.ui.notify(formatMemoryDebugEvent(event), "info");
+
+  function createRuntimeHost(
+    context: ExtensionContext,
+    generation: number,
+  ): SessionMemoryHost {
+    const piHost = createPiHost(
+      pi,
+      () => (generation === runtimeGeneration ? currentContext : undefined),
+    );
+    const ui = context.ui;
+    const setStatus = ui?.setStatus?.bind(ui);
+    const notify = ui?.notify?.bind(ui);
+    let lastInspection: MemoryInspection | undefined;
+    const renderStatus = (inspection?: MemoryInspection): void => {
+      if (generation !== runtimeGeneration || !setStatus) return;
+      if (inspection) lastInspection = inspection;
+      if (!memory || !settings || !settings.enabled) {
+        setStatus("observational-memory-metrics", undefined);
+        return;
       }
-    },
-    setStatus(next) {
-      activity = next;
-      if (currentContext) refreshStatus(currentContext);
-    },
-  };
+      if (!lastInspection) return;
+      setStatus(
+        "observational-memory-metrics",
+        formatMemoryStatus(lastInspection, activity),
+      );
+    };
+    refreshRuntimeStatus = renderStatus;
+    notifyRuntimeError = (message) => {
+      if (generation === runtimeGeneration) notify?.(message, "error");
+    };
+
+    return {
+      ...piHost,
+      debugEvent(event) {
+        if (generation !== runtimeGeneration) return;
+        pi.appendEntry(DEBUG_EVENT_CUSTOM_TYPE, event);
+        const isRoutineMaintenanceEvent =
+          event.event === "maintenance-requested" ||
+          event.event === "maintenance-started" ||
+          (event.event === "maintenance-completed" &&
+            event.reason === "settled" &&
+            event.detail === "0 observations, 0 reflections");
+        if (!isRoutineMaintenanceEvent) {
+          notify?.(formatMemoryDebugEvent(event), "info");
+        }
+      },
+      setStatus(next) {
+        if (generation !== runtimeGeneration) return;
+        activity = next;
+        renderStatus();
+      },
+    };
+  }
 
   function stopMaintenance(
     reason:
@@ -186,34 +225,57 @@ export function registerObservationalMemory(
 
     maintenanceRequested = false;
     const maintainedMemory = memory;
+    const generation = runtimeGeneration;
     const controller = new AbortController();
     maintenanceController = controller;
     const task = maintainedMemory
       .maintain(
-        () => snapshot(currentContext ?? context),
+        () => {
+          if (
+            controller.signal.aborted ||
+            generation !== runtimeGeneration ||
+            !currentContext
+          ) {
+            throw new Error("Memory maintenance runtime is no longer active");
+          }
+          return snapshot(currentContext);
+        },
         controller.signal,
       )
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted) {
-          context.ui.notify(
-            error instanceof Error ? error.message : String(error),
-            "error",
-          );
-        }
-      })
+      .then(
+        (result) => {
+          if (
+            generation === runtimeGeneration &&
+            memory === maintainedMemory
+          ) {
+            refreshRuntimeStatus?.(result.inspection);
+          }
+        },
+        (error: unknown) => {
+          if (
+            !controller.signal.aborted &&
+            generation === runtimeGeneration &&
+            memory === maintainedMemory
+          ) {
+            notifyRuntimeError?.(
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        },
+      )
       .finally(() => {
-        if (maintenanceTask !== task) return;
+        if (
+          maintenanceTask !== task ||
+          generation !== runtimeGeneration ||
+          memory !== maintainedMemory
+        ) {
+          return;
+        }
         const shouldRestart = maintenanceRequested;
         maintenanceRequested = false;
         maintenanceController = undefined;
         maintenanceTask = undefined;
-        if (currentContext) refreshStatus(currentContext);
-        if (
-          shouldRestart &&
-          currentContext &&
-          memory === maintainedMemory &&
-          settings?.enabled
-        ) {
+        if (shouldRestart && currentContext && settings?.enabled) {
           kickMaintenance(currentContext);
         }
       });
@@ -237,15 +299,8 @@ export function registerObservationalMemory(
   }
 
   function refreshStatus(context: ExtensionContext): void {
-    if (!context.ui?.setStatus) return;
-    if (!memory || !settings || !settings.enabled) {
-      context.ui.setStatus("observational-memory-metrics", undefined);
-      return;
-    }
-    context.ui.setStatus(
-      "observational-memory-metrics",
-      formatMemoryStatus(memory.inspect(snapshot(context)), activity),
-    );
+    if (!memory) return;
+    refreshRuntimeStatus?.(memory.inspect(snapshot(context)));
   }
 
   function applySettings(
@@ -273,9 +328,11 @@ export function registerObservationalMemory(
     removeTerminalInputListener?.();
     removeTerminalInputListener = undefined;
     memory?.dispose();
+    runtimeGeneration += 1;
     activity = undefined;
     currentContext = context;
     settings = loadSettings(context);
+    host = createRuntimeHost(context, runtimeGeneration);
     memory =
       createMemory === createSessionMemory
         ? createSessionMemory(host, settings)
@@ -344,7 +401,7 @@ export function registerObservationalMemory(
 
     return {
       messages: await memory.project(
-        snapshot(context, estimateFixedInputTokens(pi, context, host)),
+        snapshot(context, estimateFixedInputTokens(pi, context, host!)),
         event.messages,
         context.signal,
       ),
@@ -352,13 +409,17 @@ export function registerObservationalMemory(
   });
 
   pi.on("session_shutdown", () => {
+    runtimeGeneration += 1;
+    currentContext = undefined;
+    refreshRuntimeStatus = undefined;
+    notifyRuntimeError = undefined;
     stopMaintenance("shutdown");
     removeTerminalInputListener?.();
     removeTerminalInputListener = undefined;
     memory?.dispose();
     memory = undefined;
+    host = undefined;
     settings = undefined;
-    currentContext = undefined;
   });
 
   pi.registerCommand?.("stock-compact", {

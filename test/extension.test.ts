@@ -340,6 +340,159 @@ describe("observational-memory extension", () => {
     await vi.waitFor(() => expect(maintain).toHaveBeenCalledTimes(2));
   });
 
+  it("does not access a stale context when background maintenance settles after replacement", async () => {
+    const { pi, handlers } = extensionApi();
+    let finishMaintenance!: (
+      result: ReturnType<typeof memoryCompactionResult>,
+    ) => void;
+    const maintain = vi.fn(
+      () =>
+        new Promise<ReturnType<typeof memoryCompactionResult>>((resolve) => {
+          finishMaintenance = resolve;
+        }),
+    );
+    const activeContext = context([]);
+    const activeUi = activeContext.ui;
+    let stale = false;
+    let staleReads = 0;
+    const ctx = Object.defineProperty(
+      { ...activeContext },
+      "ui",
+      {
+        get() {
+          if (stale) {
+            staleReads += 1;
+            throw new Error(
+              "This extension ctx is stale after session replacement or reload",
+            );
+          }
+          return activeUi;
+        },
+      },
+    ) as ExtensionContext;
+
+    registerObservationalMemory(pi, () => ({ ...memorySpies(), maintain }));
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "resume" },
+      ctx,
+    );
+    await vi.waitFor(() => expect(maintain).toHaveBeenCalledOnce());
+    await handlers.get("turn_end")?.(
+      { type: "turn_end", turnIndex: 0, message: undefined, toolResults: [] },
+      ctx,
+    );
+
+    stale = true;
+    finishMaintenance(memoryCompactionResult());
+    await vi.waitFor(() => expect(maintain).toHaveBeenCalledTimes(2));
+
+    expect(staleReads).toBe(0);
+  });
+
+  it("reports delayed maintenance rejection without rereading a stale context", async () => {
+    const { pi, handlers } = extensionApi();
+    let rejectMaintenance!: (error: Error) => void;
+    const maintain = vi.fn(
+      () =>
+        new Promise<ReturnType<typeof memoryCompactionResult>>(
+          (_resolve, reject) => {
+            rejectMaintenance = reject;
+          },
+        ),
+    );
+    const activeContext = context([]);
+    const activeUi = activeContext.ui;
+    let stale = false;
+    let staleReads = 0;
+    const ctx = Object.defineProperty(
+      { ...activeContext },
+      "ui",
+      {
+        get() {
+          if (stale) {
+            staleReads += 1;
+            throw new Error(
+              "This extension ctx is stale after session replacement or reload",
+            );
+          }
+          return activeUi;
+        },
+      },
+    ) as ExtensionContext;
+
+    registerObservationalMemory(pi, () => ({ ...memorySpies(), maintain }));
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "resume" },
+      ctx,
+    );
+    await vi.waitFor(() => expect(maintain).toHaveBeenCalledOnce());
+
+    stale = true;
+    rejectMaintenance(new Error("maintenance failed"));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(staleReads).toBe(0);
+    expect(activeUi.notify).toHaveBeenCalledWith("maintenance failed", "error");
+  });
+
+  it("fences delayed maintenance snapshots before a shutdown context becomes stale", async () => {
+    const { pi, handlers } = extensionApi();
+    let finishMaintenance!: () => void;
+    const maintain = vi.fn(
+      (getSnapshot: () => unknown) =>
+        new Promise<ReturnType<typeof memoryCompactionResult>>(
+          (resolve, reject) => {
+            finishMaintenance = () => {
+              try {
+                getSnapshot();
+                resolve(memoryCompactionResult());
+              } catch (error) {
+                reject(error);
+              }
+            };
+          },
+        ),
+    );
+    const activeContext = context([]);
+    const activeUi = activeContext.ui;
+    let stale = false;
+    let staleReads = 0;
+    const ctx = Object.defineProperty(
+      { ...activeContext },
+      "ui",
+      {
+        get() {
+          if (stale) {
+            staleReads += 1;
+            throw new Error(
+              "This extension ctx is stale after session replacement or reload",
+            );
+          }
+          return activeUi;
+        },
+      },
+    ) as ExtensionContext;
+    const memory = { ...memorySpies(), maintain };
+
+    registerObservationalMemory(pi, () => memory);
+    await handlers.get("session_start")?.(
+      { type: "session_start", reason: "resume" },
+      ctx,
+    );
+    await vi.waitFor(() => expect(maintain).toHaveBeenCalledOnce());
+
+    await handlers.get("session_shutdown")?.(
+      { type: "session_shutdown", reason: "reload" },
+      ctx,
+    );
+    stale = true;
+    finishMaintenance();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(staleReads).toBe(0);
+    expect(memory.dispose).toHaveBeenCalledOnce();
+  });
+
   it("passes active Escape to Pi and uses a later idle Escape to stop background memory", async () => {
     const { pi, handlers } = extensionApi();
     let terminalInput:
@@ -853,8 +1006,10 @@ describe("observational-memory extension", () => {
       ui: { setStatus: newSetStatus },
     } as unknown as ExtensionContext;
     const second = memorySpies();
+    let firstHost: SessionMemoryHost | undefined;
     const createMemory = vi.fn((host: SessionMemoryHost) => {
       if (createMemory.mock.calls.length > 1) return second;
+      firstHost = host;
       return {
         ...memorySpies(),
         dispose: vi.fn(() => host.setStatus?.("disposing old runtime")),
@@ -880,6 +1035,17 @@ describe("observational-memory extension", () => {
     expect(newSetStatus).toHaveBeenCalledWith(
       "observational-memory-metrics",
       "msg 0 (0%) • obs 0 (0%) • refl 0 (0%)",
+    );
+
+    firstHost?.setStatus?.("late old runtime update");
+
+    expect(oldSetStatus).not.toHaveBeenCalledWith(
+      "observational-memory-metrics",
+      expect.stringContaining("late old runtime update"),
+    );
+    expect(newSetStatus).not.toHaveBeenCalledWith(
+      "observational-memory-metrics",
+      expect.stringContaining("late old runtime update"),
     );
     expect(second.restore).toHaveBeenCalledOnce();
   });
